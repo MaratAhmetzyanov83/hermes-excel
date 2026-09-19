@@ -1,0 +1,7 @@
+# единые переводы строк в репозитории; .ps1/.cmd — CRLF, как ждёт Windows
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.png binary
+*.xlsx binary
