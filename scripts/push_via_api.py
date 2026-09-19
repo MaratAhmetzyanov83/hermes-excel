@@ -45,6 +45,15 @@ def gh_api(path: str, method: str = "GET", body: dict | None = None, allow_fail:
     sys.exit(f"gh api {method} {path} → не удалось за {attempts} попыток: {last}")
 
 
+def file_bytes(rel: str) -> bytes:
+    """Байты ровно такие, какие отправил бы `git push`: содержимое из индекса
+    (с применёнными фильтрами .gitattributes), а не то, что лежит на диске."""
+    proc = subprocess.run(["git", "cat-file", "blob", f":{rel}"], cwd=ROOT, capture_output=True)
+    if proc.returncode == 0 and proc.stdout:
+        return proc.stdout
+    return (ROOT / rel).read_bytes()
+
+
 def tracked_files() -> list[str]:
     out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True)
     return [line for line in out.stdout.splitlines() if line.strip()]
@@ -78,7 +87,7 @@ def main() -> None:
         # поэтому заводим первый коммит через Contents API — он и создаёт ветку.
         boot = "README.md" if "README.md" in files else files[0]
         first = boot.replace("\\", "/")
-        data = (ROOT / boot).read_bytes()
+        data = file_bytes(boot)
         gh_api(f"repos/{a.repo}/contents/{first}", "PUT",
                {"message": message, "content": base64.b64encode(data).decode("ascii")})
         head = gh_api(f"repos/{a.repo}/git/ref/heads/{a.branch}")
@@ -89,7 +98,7 @@ def main() -> None:
     print(f"2/4 блобы ({len(files)} шт.)…")
     tree = []
     for rel in files:
-        data = (ROOT / rel).read_bytes()
+        data = file_bytes(rel)
         payload = {"content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}
         blob = gh_api(f"repos/{a.repo}/git/blobs", "POST", payload)
         tree.append({"path": rel.replace("\\", "/"), "mode": "100644", "type": "blob", "sha": blob["sha"]})
