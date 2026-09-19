@@ -152,6 +152,30 @@ grep -a "taskpane.html" workspace/bridge.log
     «данных нет, не задавай уточняющих вопросов, верни результат блоком ```csv». Без этого модель
     отвечает встречным вопросом, и пользователь думает, что «оно не работает».
 
+## Если `git push` не проходит (TLS/VPN)
+
+На машине с VPN или DPI-фильтрацией `git push` может рваться на TLS — `schannel: failed to receive
+handshake` либо `unexpected eof while reading` — хотя обычные запросы к `api.github.com` через `gh`
+работают. Залить изменения без git-транспорта:
+
+```bash
+git add -A && git commit -m "…"
+python scripts/push_via_api.py --repo <owner>/<name>      # коммит собирается через Git Data API
+```
+
+Скрипт берёт байты **из индекса git** (`git cat-file blob :path`), то есть ровно то, что отправил бы
+обычный push, а не то, что лежит на диске; умеет завести первый коммит в пустом репозитории
+(Contents API, иначе Git Data API отвечает `409 Git Repository is empty`) и повторяет запросы при
+обрывах. Проверка, что всё уехало ровно так, как в индексе:
+
+```bash
+git ls-files -s | while read mode sha stage path; do
+  remote=$(gh api "repos/<owner>/<name>/git/trees/main?recursive=1" \
+    --jq ".tree[] | select(.path==\"$path\") | .sha")
+  [ "$sha" = "$remote" ] && echo "ok $path" || echo "РАСХОЖДЕНИЕ $path"
+done
+```
+
 ## Как менять панель
 
 1. Правь `addin/taskpane.js|css|html` (статика отдаётся с `Cache-Control: no-store`, перезагрузки хватает).
