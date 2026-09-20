@@ -12,6 +12,7 @@ const state = {
   busy: false, controller: null, messages: [], bridgeOk: null,
   ctx: { csv: "", meta: {}, empty: false, anchor: "" },
   autoWrite: true, useCtx: true, tries: 0,
+  atts: [],                 // приложенные файлы: {name, kind, path, preview}
   ctxDirty: false,          // пользователь правил CSV контекста руками — не затирать
   frozen: null,             // цель записи, замороженная в момент отправки
   lastWrite: null,          // снимок листа для «Отменить»
@@ -447,11 +448,92 @@ function setSession(id) {
   renderBridge();
 }
 
+/* ------------------------------------------------------------------ вложения */
+
+const MAX_ATT = 8;
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(new Error("не смог прочитать файл"));
+    fr.onload = () => resolve(String(fr.result).split(",")[1] || "");
+    fr.readAsDataURL(file);
+  });
+}
+
+function renderAtts() {
+  const box = $("atts"), row = $("attsRow");
+  box.classList.toggle("hidden", state.atts.length === 0);
+  row.innerHTML = "";
+  state.atts.forEach((a) => {
+    const chip = document.createElement("div");
+    chip.className = "att-chip" + (a.busy ? " busy" : "") + (a.error ? " failed" : "");
+    if (a.preview) {
+      const img = document.createElement("img");
+      img.src = a.preview;
+      chip.appendChild(img);
+    }
+    const nm = document.createElement("span");
+    nm.className = "nm";
+    nm.textContent = a.name + (a.error ? " — " + a.error : a.busy ? " — загружаю…" : "");
+    nm.title = a.path || a.name;
+    chip.appendChild(nm);
+    const x = document.createElement("span");
+    x.className = "x";
+    x.textContent = "✕";
+    x.title = "убрать";
+    x.onclick = () => {
+      if (a.preview) URL.revokeObjectURL(a.preview);
+      state.atts = state.atts.filter((b) => b !== a);
+      renderAtts();
+    };
+    chip.appendChild(x);
+    row.appendChild(chip);
+  });
+}
+
+/* Файл уходит в мост (POST /upload) и ложится в workspace/pane/uploads: агенту передаём путь. */
+async function addFiles(files) {
+  const list = [...(files || [])].filter(Boolean);
+  if (!list.length) return;
+  for (const f of list) {
+    if (state.atts.length >= MAX_ATT) { toast(`Больше ${MAX_ATT} файлов за раз не беру`, true); break; }
+    const isImg = (f.type || "").startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name);
+    const att = { name: f.name || "file", kind: isImg ? "image" : "file", busy: true,
+                  preview: isImg ? URL.createObjectURL(f) : "" };
+    state.atts.push(att);
+    renderAtts();
+    try {
+      const data = await fileToBase64(f);
+      const r = await fetch(BASE + "/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Hermes-Bridge": "1" },
+        body: JSON.stringify({ name: f.name, kind: att.kind, data }),
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || ("HTTP " + r.status));
+      att.path = d.path; att.busy = false;
+    } catch (e) {
+      att.busy = false; att.error = (e.message || "ошибка").slice(0, 40);
+      toast("Файл не приложился: " + (e.message || e), true);
+    }
+    renderAtts();
+  }
+}
+
+function clearAtts() {
+  state.atts.forEach((a) => { if (a.preview) URL.revokeObjectURL(a.preview); });
+  state.atts = [];
+  renderAtts();
+}
+
 /* ------------------------------------------------------------------ отправка */
 
 async function send() {
   if (state.busy) return;
-  const prompt = $("prompt").value.trim();
+  const ready = state.atts.filter((a) => a.path);
+  if (state.atts.some((a) => a.busy)) { toast("Секунду: файл ещё загружается", true); return; }
+  const prompt = $("prompt").value.trim() || (ready.length ? "Посмотри вложение и скажи, что в нём." : "");
   if (!prompt) return;
   if (state.bridgeOk === false) { toast("Мост не запущен: start-bridge.cmd", true); loadCatalog(0); return; }
 
@@ -467,12 +549,13 @@ async function send() {
     file_name: state.workbook, sheet: state.ctx.meta.sheet || "", range: state.ctx.meta.range || "",
     shape: state.ctx.meta.shape || null,
     context: { csv: useCsv, note: state.ctx.meta.note || "", empty: !useCsv },
+    attachments: ready.map((a) => ({ path: a.path, name: a.name, kind: a.kind })),
   };
 
   $("prompt").value = "";
   autoGrow();
   if (!$("chat").querySelector(".msg")) $("chat").innerHTML = "";
-  addMessage("user", prompt);
+  addMessage("user", prompt + (ready.length ? "\n📎 " + ready.map((a) => a.name).join(", ") : ""));
   freezeTarget();                                  // пишем туда, где было выделено при отправке
   state.busy = true; state.runId = null; state.toolCount = 0;
   $("btnSend").classList.add("hidden"); $("btnStop").classList.remove("hidden");
@@ -490,6 +573,7 @@ async function send() {
       signal: state.controller.signal,
     });
     if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+    clearAtts();                                   // файлы уже на диске и переданы агенту
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -673,6 +757,30 @@ function wire() {
     if (v) { setSession(v); loadHistory(); toast("Продолжаю чат " + v); }
   };
   $("prompt").addEventListener("input", autoGrow);
+  // вложения: скрепка, перетаскивание в панель, вставка из буфера
+  $("btnAttach").onclick = () => $("filePick").click();
+  $("filePick").onchange = () => { addFiles($("filePick").files); $("filePick").value = ""; };
+  let dragDepth = 0;
+  document.addEventListener("dragenter", (e) => {
+    if (![...(e.dataTransfer?.types || [])].includes("Files")) return;
+    e.preventDefault(); dragDepth++; document.body.classList.add("drag");
+  });
+  document.addEventListener("dragover", (e) => {
+    if ([...(e.dataTransfer?.types || [])].includes("Files")) e.preventDefault();
+  });
+  document.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) document.body.classList.remove("drag");
+  });
+  document.addEventListener("drop", (e) => {
+    dragDepth = 0; document.body.classList.remove("drag");
+    const files = e.dataTransfer?.files;
+    if (files && files.length) { e.preventDefault(); addFiles(files); }
+  });
+  document.addEventListener("paste", (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
   $("prompt").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });

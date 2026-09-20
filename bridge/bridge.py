@@ -65,10 +65,15 @@ SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
 # Панель отвечает текстом и блоками ```csv/```formulas: браузер, картинки, cron и делегирование
 # ей не нужны. Узкий набор вдвое уменьшает промпт (схемы инструментов) и убирает круги
 # «попробовал инструмент — политика запретила». Расширяется через HERMES_BRIDGE_TOOLSETS.
-PANE_TOOLSETS = os.environ.get("HERMES_BRIDGE_TOOLSETS", "file")
+PANE_TOOLSETS = os.environ.get("HERMES_BRIDGE_TOOLSETS", "file,vision")
 PANE_SKILLS = [s for s in os.environ.get("HERMES_BRIDGE_SKILLS", "excel-pane-contract").split(",") if s]
 # Бюджет прогона: на 80 % модель получает предупреждение и успевает свернуть работу.
 RUN_BUDGET = float(os.environ.get("HERMES_BRIDGE_RUN_BUDGET", "240"))
+# Метка источника сессии. КРИТИЧНО: без неё одноразовый прогон (`-Q --query-file`) помечается
+# Hermes как source='oneshot', а oneshot входит в INTERNAL_LISTING_SOURCES — такие сессии
+# исключены из ВСЕХ человеческих списков (десктоп, TUI, `hermes sessions list`), и чаты,
+# начатые в Excel, просто не видны в Hermes. Отсюда же снят `--source excel`.
+PANE_SOURCE = os.environ.get("HERMES_BRIDGE_SOURCE", "excel")
 RUN_TIMEOUT = float(os.environ.get("HERMES_BRIDGE_TIMEOUT", "1800"))
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)
@@ -84,6 +89,11 @@ except OSError:
     QUERY_DIR = WORKSPACE
 PANE_DIR = WORKSPACE / "pane"
 PANE_DIR.mkdir(parents=True, exist_ok=True)
+# Куда падают файлы и картинки, которые пользователь бросил в панель. Отдаём агенту абсолютные пути;
+# путь из запроса принимаем только внутри этого каталога.
+UPLOAD_DIR = PANE_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_BYTES = int(os.environ.get("HERMES_BRIDGE_MAX_UPLOAD", str(25 * 1024 * 1024)))
 for stale in WORKSPACE.glob(".query-*.txt"):                  # уборка с прошлых версий моста
     stale.unlink(missing_ok=True)
 
@@ -195,7 +205,12 @@ def session_messages(session_id: str, limit: int = 12) -> list[dict]:
 
 
 def list_sessions(limit: int = 40) -> list[dict]:
-    """Последние сессии из общего стора Hermes (только чтение)."""
+    """Последние сессии из стора бота (только чтение).
+
+    Фильтр тот же, что у человеческих списков Hermes: исключаем внутренние источники
+    (kanban/tool/oneshot) и скрытые сессии — иначе панель показывала бы то, чего нет в десктопе,
+    и наоборот.
+    """
     if not STATE_DB.exists():
         return []
     try:
@@ -206,6 +221,7 @@ def list_sessions(limit: int = 40) -> list[dict]:
                       last_activity_at, estimated_cost_usd
                  FROM sessions
                 WHERE COALESCE(archived,0)=0 AND COALESCE(hidden,0)=0
+                  AND COALESCE(source,'') NOT IN ('kanban','tool','oneshot')
                 ORDER BY COALESCE(last_activity_at, started_at) DESC
                 LIMIT ?""",
             (int(limit),),
@@ -233,8 +249,64 @@ def error_hint(text: str) -> str:
     return ""
 
 
+def save_upload(name: str, kind: str, data_b64: str) -> dict:
+    """Сохраняет вложенный файл в uploads/ и возвращает путь для агента.
+
+    Имя санитизируем (никаких путей и «..»), размер ограничиваем, дубликаты нумеруем.
+    """
+    import base64 as _b64
+    safe = re.sub(r"[^\w.\-() ]+", "_", (name or "").strip()).lstrip(". ")[:80]
+    if not safe:
+        safe = "file"
+    if kind not in ("image", "file"):
+        kind = "image" if safe.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")) else "file"
+    try:
+        raw = _b64.b64decode(data_b64 or "", validate=False)
+    except Exception:                                         # noqa: BLE001
+        return {"ok": False, "error": "не удалось разобрать base64"}
+    if not raw:
+        return {"ok": False, "error": "пустой файл"}
+    if len(raw) > MAX_UPLOAD_BYTES:
+        return {"ok": False, "error": f"файл больше {MAX_UPLOAD_BYTES // (1024*1024)} МБ"}
+    target = UPLOAD_DIR / safe
+    stem, suffix = target.stem, target.suffix
+    n = 1
+    while target.exists():
+        target = UPLOAD_DIR / f"{stem}-{n}{suffix}"
+        n += 1
+    try:
+        target.write_bytes(raw)
+    except OSError as exc:
+        return {"ok": False, "error": f"не смог записать: {exc}"}
+    log(f"upload: {target.name} ({len(raw)} байт, {kind})")
+    return {"ok": True, "path": str(target), "name": target.name, "kind": kind, "size": len(raw)}
+
+
+def clean_attachments(raw: object) -> list[dict]:
+    """Вложения из панели. Принимаем только пути ВНУТРИ uploads/ — иначе запрос мог бы заставить
+    агента открыть любой файл машины (мост и клиент — разные доверия)."""
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:8]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            p = Path(str(item.get("path") or "")).resolve()
+            p.relative_to(UPLOAD_DIR.resolve())
+        except (OSError, ValueError):
+            log("attachments: путь вне uploads отклонён:", item.get("path"))
+            continue
+        if not p.is_file():
+            continue
+        out.append({"path": str(p), "name": str(item.get("name") or p.name)[:80],
+                    "kind": "image" if str(item.get("kind")) == "image" else "file"})
+    return out
+
+
 def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
-                rng: str, shape: tuple[int, int] | None) -> str:
+                rng: str, shape: tuple[int, int] | None,
+                attachments: list[dict] | None = None) -> str:
     """Собирает итоговый промпт: сначала контекст листа, затем задачу пользователя."""
     parts: list[str] = []
     empty = bool(context and context.get("empty"))
@@ -265,6 +337,16 @@ def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
             "Ответь одним коротким предложением, что именно подготовил, и обязательно верни готовый результат "
             "ОТДЕЛЬНЫМ блоком ```csv (первая строка — шапка, разделитель — запятая) либо блоком ```formulas "
             "с формулами по одной в строке. Никакого текста после блока."
+        )
+    if attachments:
+        # Файлы, брошенные в панель: отдаём абсолютные пути и сразу говорим, что с ними делать —
+        # иначе агент отвечает «пришлите файл» вместо того, чтобы открыть то, что уже лежит на диске.
+        listing = "\n".join(f"— {a['name']} ({a['kind']}): {a['path']}" for a in attachments)
+        parts.append(
+            "[Вложения из панели] Пользователь приложил файлы, они уже лежат на диске:\n"
+            f"{listing}\n"
+            "Открой их сам: картинку — инструментом просмотра изображений, документ или таблицу "
+            "(pdf, docx, xlsx, csv, txt) — чтением файла. Не спрашивай, что внутри: посмотри."
         )
     parts.append(prompt or "Проанализируй выделенный диапазон.")
     return "\n\n".join(parts)
@@ -443,6 +525,14 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             self._json(self._open_session(str(body.get("session_id") or "")))
             return
+        if path == "/upload":
+            payload = self._body()
+            if getattr(self, "_body_failed", False) or not payload:
+                self._json({"ok": False, "error": "тело запроса не разобралось (нужен UTF-8 JSON)"}, 400)
+                return
+            self._json(save_upload(str(payload.get("name") or ""), str(payload.get("kind") or ""),
+                                   str(payload.get("data") or "")))
+            return
         self._drain()
         self._json({"error": "not found", "path": path}, 404)
 
@@ -472,7 +562,8 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             max_turns = "40"
         query = build_query(prompt, context, str(body.get("file_name") or ""),
-                            str(body.get("sheet") or ""), str(body.get("range") or ""), shape)
+                            str(body.get("sheet") or ""), str(body.get("range") or ""), shape,
+                            clean_attachments(body.get("attachments")))
 
         run_id = uuid.uuid4().hex[:8]
         qfile = QUERY_DIR / f"query-{run_id}.txt"
@@ -486,6 +577,9 @@ class Handler(BaseHTTPRequestHandler):
             cmd += ["-p", PROFILE]
         cmd += ["chat", "-Q", "--format", "stream-json", "--query-file", str(qfile),
                 "--max-turns", max_turns, "--in", str(PANE_DIR)]
+        if PANE_SOURCE:
+            # без метки сессия уедет в source='oneshot' и пропадёт из списков Hermes
+            cmd += ["--source", PANE_SOURCE]
         if PANE_TOOLSETS:
             cmd += ["-t", PANE_TOOLSETS]
         for skill in PANE_SKILLS:

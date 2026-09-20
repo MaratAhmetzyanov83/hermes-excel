@@ -157,6 +157,29 @@ def main() -> int:
         payload = {}
     check(code == 200 and payload.get("killed") == 0, f"пустой /stop → {body.decode('utf-8', 'replace')[:60]}")
 
+    print("\n6. Загрузка вложений")
+    import base64
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
+    code, body = request("/upload", "POST", {"name": "../побег.png", "kind": "image", "data": png},
+                         {"X-Hermes-Bridge": "1"})
+    try:
+        up = json.loads(body)
+    except Exception:                                          # noqa: BLE001
+        up = {}
+    name = str(up.get("name") or "")
+    check(code == 200 and up.get("ok") and ".." not in name and "/" not in name and "\\" not in name,
+          f"имя санитизировано: {name!r}")
+    check(str(up.get("path") or "").replace("\\", "/").endswith("/pane/uploads/" + name),
+          "файл лёг только в pane/uploads")
+    code, body = request("/upload", "POST", {"name": "x.png", "kind": "image", "data": "!!!не base64!!!"},
+                         {"X-Hermes-Bridge": "1"})
+    check(code == 200 and b'"ok": false' in body.replace(b'"ok":false', b'"ok": false'),
+          "мусорный base64 отклонён без падения")
+    code, body = request("/chat", "POST", {"prompt": "x", "attachments": [
+        {"path": "C:/Windows/System32/drivers/etc/hosts", "name": "hosts", "kind": "file"}]},
+        {"X-Hermes-Bridge": "1"})
+    check(code == 200, "путь вне uploads не ломает ход (вложение отброшено)")
+
     bad = [t for ok, t in results if not ok]
     print(f"\nитог: {len(results) - len(bad)}/{len(results)} проверок пройдено"
           + (f"; провалены: {bad}" if bad else ""))

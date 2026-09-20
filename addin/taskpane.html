@@ -42,8 +42,17 @@
     <div class="ctxedit-actions"><button id="btnCtxDone" class="primary sm">Готово</button></div>
   </section>
 
+  <section id="atts" class="atts hidden">
+    <div class="atts-row" id="attsRow"></div>
+    <div class="atts-hint">перетащите файлы в панель, вставьте из буфера (Ctrl+V) или выберите скрепкой — картинки и документы попадут агенту</div>
+  </section>
+
   <footer class="composer">
     <div class="composer-box">
+      <button id="btnAttach" class="attach" title="Прикрепить файл или картинку">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 6.5 8 11a2 2 0 0 0 2.8 2.8l4.7-4.7a3.5 3.5 0 0 0-5-5L5.8 8.8a5 5 0 0 0 7 7l3.4-3.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+      <input type="file" id="filePick" multiple hidden/>
       <textarea id="prompt" rows="1" placeholder="Спросите что угодно о таблице"></textarea>
       <button id="btnSend" class="send" title="Отправить">
         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 15.5v-11m0 0L5.5 9M10 4.5 14.5 9" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>

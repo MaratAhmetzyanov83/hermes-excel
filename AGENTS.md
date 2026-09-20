@@ -118,8 +118,11 @@ curl -sN --ssl-no-revoke -X POST -H "Content-Type: application/json" -H "X-Herme
 hermes -p excel sessions list --limit 3     # та же сессия видна в сторе бота
 
 # 6b. Регрессии моста без Excel: обход каталога, инъекция в /open, CSRF, мусорное тело,
-#     адресный стоп — 13 проверок
+#     вложения (/upload, санитизация, белый список путей), адресный стоп — 17 проверок
 python scripts/test-bridge-security.py
+
+# 6b-2. Вложения: картинка + CSV уходят в uploads и агент их реально открывает
+python scripts/test-attachments.py
 
 # 6c. Панель: оффлайн-тест на строгом моке Office.js, включая сценарии записи в лист
 python scripts/make-pane-test.py
@@ -150,7 +153,9 @@ grep -a "taskpane.html" workspace/bridge.log
 | `scripts/bridge-watchdog.ps1` | сторож: поднимает мост, если тот не отвечает (раз в минуту + при входе в Windows) |
 | `scripts/install-watchdog.ps1` | ставит/снимает сторожа, `-Status` |
 | `scripts/doctor.ps1` / `doctor.cmd` | проверка надстройки одной командой (11 пунктов), `-Json`, `-Fix` |
-| `scripts/test-bridge-security.py` | регрессии моста: обход каталога, инъекция, CSRF, адресный стоп (13 проверок) |
+| `scripts/test-bridge-security.py` | регрессии моста: обход каталога, инъекция, CSRF, вложения, адресный стоп (17 проверок) |
+| `scripts/test-attachments.py` | вложения: загрузка в мост, санитизация имён, чтение файлов агентом |
+| `scripts/retag-sessions.py` | разовая починка: сессии панели `oneshot` → видимый источник (`excel`) |
 | `scripts/check-workbook.py` | книга авто-открытия: части webextensions и совпадение Id с манифестом |
 | `scripts/bench-turn.py`, `scripts/bench-bot.py` | замер хода и разбор прогона по событиям |
 | `scripts/autostart-install.ps1` | (устарело) автозапуск ярлыком — заменён сторожем |
@@ -219,6 +224,20 @@ grep -a "taskpane.html" workspace/bridge.log
 18. **Интерактивные подтверждения вешают агента.** `hermes profile delete <имя>` без `-y` спрашивает
     «Type '<имя>' to confirm» и ждёт ввода — в скриптах добавляйте `-y`, а после удаления
     `hermes profile purge-identity <имя>` (иначе остаётся «хвост» сессий/маршрутизации).
+19. **Одноразовый прогон получает источник `oneshot` — и чаты пропадают из Hermes.** Мост запускает
+    `hermes chat -Q --query-file`, это finite-run, и Hermes помечает такую сессию `source='oneshot'`,
+    а `hermes_state_sessions.INTERNAL_LISTING_SOURCES = ("kanban","tool","oneshot")` исключает её из
+    **всех** человеческих списков (десктоп Bots, TUI, `hermes sessions list`). Симптом: «в Excel чат
+    есть, в Hermes чатов нет». Лечится флагом `--source excel` в команде моста
+    (`HERMES_BRIDGE_SOURCE`, по умолчанию `excel`); уже созданные сессии — `scripts/retag-sessions.py`.
+    Заодно панель обязана фильтровать свой список так же (`NOT IN ('kanban','tool','oneshot')`),
+    иначе она показывает то, чего нет в Hermes.
+20. **Вложения панели = base64 в JSON + санитизация + белый список путей.** Мост принимает `POST /upload`
+    (JSON `{name, kind, data}`), кладёт файл в `workspace/pane/uploads`, имя чистится от `..` и
+    разделителей, размер ограничен `HERMES_BRIDGE_MAX_UPLOAD`. В `/chat` пути из `attachments`
+    принимаются только внутри этого каталога (`clean_attachments`), иначе запрос заставил бы агента
+    открыть любой файл машины. Агент открывает вложения сам — картинки требуют набора `vision`
+    (`HERMES_BRIDGE_TOOLSETS="file,vision"` по умолчанию), документы — `read_file`.
 
 ## Если `git push` не проходит (TLS/VPN)
 

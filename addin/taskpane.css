@@ -92,7 +92,25 @@ select,textarea{font:inherit;color:inherit;background:var(--bg);border:none;outl
 .preview .cap{color:var(--mut);font-size:11.5px;margin:6px 0 3px}
 .preview pre.code{max-height:180px;overflow:auto}
 .msg.old{opacity:.75}
-/* тост с действием (например, «Отменить» запись) */
+/* Вложения: ряд чипов над композером + скрепка в композере */
+.atts{padding:6px 12px 2px;border-top:1px solid var(--line-2)}
+.atts-row{display:flex;gap:6px;flex-wrap:wrap}
+.att-chip{display:flex;align-items:center;gap:6px;max-width:100%;border:1px solid var(--line);
+          border-radius:10px;padding:4px 8px;background:#fbfbfb;font-size:11.5px;color:var(--mut2)}
+.att-chip img{width:26px;height:26px;object-fit:cover;border-radius:6px}
+.att-chip .nm{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.att-chip .x{cursor:pointer;color:var(--mut);font-size:13px;line-height:1}
+.att-chip .x:hover{color:var(--err)}
+.att-chip.busy{opacity:.6}
+.att-chip.failed{border-color:var(--err);color:var(--err)}
+.atts-hint{color:var(--mut);font-size:11px;margin:4px 0 2px}
+.attach{border:none;background:transparent;color:var(--mut2);padding:6px;border-radius:9px;cursor:pointer}
+.attach:hover{background:var(--hover);color:var(--fg)}
+/* подсветка при перетаскивании файла */
+body.drag::after{content:"отпустите файл — приложу его к сообщению";position:fixed;inset:8px;
+  border:2px dashed var(--accent);border-radius:14px;background:rgba(255,255,255,.86);
+  display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--mut2);z-index:20}
+
 .toast-act{margin-left:10px;border:1px solid rgba(255,255,255,.45);border-radius:999px;
            padding:2px 10px;font-size:12px;color:#fff;background:transparent;cursor:pointer}
 .toast-act:hover{background:rgba(255,255,255,.16)}
