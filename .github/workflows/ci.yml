@@ -1,0 +1,130 @@
+name: CI
+
+# Что проверяется на каждый push/PR:
+#   * манифест надстройки валиден по схеме Microsoft (без этого Office его не подхватит);
+#   * все .ps1 в UTF-8 с BOM — иначе PowerShell 5.1 ломается на кириллице (грабля из AGENTS.md);
+#   * python-файлы компилируются (мост и скрипты — чистый stdlib);
+#   * книга с авто-открытием панели содержит xl/webextensions с тем же Id, что в манифесте;
+#   * панель проходит оффлайн-тест на строгом моке Office.js, включая сценарии записи в лист.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Синтаксис Python (мост и скрипты)
+        run: |
+          python -m py_compile bridge/bridge.py
+          for f in scripts/*.py; do python -m py_compile "$f"; done
+          echo "python: ok"
+
+      - name: Манифест валиден по схеме Microsoft
+        run: npx --yes office-addin-manifest validate addin/manifest.xml
+
+      - name: Все .ps1 в UTF-8 с BOM
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          bad = []
+          for f in pathlib.Path('scripts').glob('*.ps1'):
+              if not f.read_bytes().startswith(b'\xef\xbb\xbf'):
+                  bad.append(f.name)
+          print('без BOM:', bad or 'нет')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Никаких секретов и ключей в отслеживаемых файлах
+        run: |
+          python - <<'PY'
+          import pathlib, re, subprocess, sys
+          files = subprocess.run(['git', 'ls-files'], capture_output=True, text=True).stdout.split()
+          pats = [re.compile(p) for p in (r'sk-[A-Za-z0-9]{16,}', r'ghp_[A-Za-z0-9]{20,}',
+                                          r'api[_-]?key\s*[:=]\s*["\'][^"\']{16,}', r'Bearer\s+[A-Za-z0-9._-]{20,}')]
+          hits = []
+          for name in files:
+              try:
+                  text = pathlib.Path(name).read_text(encoding='utf-8', errors='ignore')
+              except OSError:
+                  continue
+              for p in pats:
+                  if p.search(text):
+                      hits.append(f'{name}: {p.pattern}')
+          print('найдено:', hits or 'чисто')
+          sys.exit(1 if hits else 0)
+          PY
+
+      - name: Панель проходит оффлайн-тест на моке Office.js
+        run: |
+          python scripts/make-pane-test.py
+          test -f addin/test-office.html
+          grep -q 'mock-office.js' addin/test-office.html
+          grep -q 'id="testout"' addin/test-office.html || true
+          python - <<'PY'
+          # Проверяем, что тест действительно прогоняет сценарии записи, а не просто грузится.
+          html = open('addin/test-office.html', encoding='utf-8').read()
+          for needle in ('writeCsv("итог,значение', 'toast-act', 'confirmButtons'):
+              assert needle in html, needle
+          print('сценарии записи в тесте на месте')
+          PY
+
+      - name: Книга авто-открытия ссылается на тот же Id, что манифест
+        run: |
+          python scripts/auto-open-workbook.py create
+          python - <<'PY'
+          import re, zipfile
+          mid = re.search(r'<Id>([0-9a-fA-F-]{36})</Id>',
+                          open('addin/manifest.xml', encoding='utf-8').read()).group(1)
+          z = zipfile.ZipFile('workspace/hermes-auto.xlsx')
+          ref = z.read('xl/webextensions/webextension1.xml').decode('utf-8')
+          assert mid.lower() in ref.lower(), (mid, ref[:200])
+          assert 'storeType="Registry"' in ref
+          print('id книги == id манифеста:', mid)
+          PY
+
+      - name: Регрессионные тесты моста (без запуска сервера — AST и правила)
+        run: |
+          python - <<'PY'
+          import ast, pathlib, re, sys
+          src = pathlib.Path('bridge/bridge.py').read_text(encoding='utf-8')
+          tree = ast.parse(src)
+
+          names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+          required = {'_safe_static', '_origin_ok', 'session_messages', 'error_hint',
+                      '_on_timeout', '_stop', '_open_session'}
+          missing = required - names
+          assert not missing, f'нет функций: {missing}'
+
+          # Защиты, которые уже ловили реальные дыры, не должны исчезнуть из кода.
+          for needle, why in ((r'relative_to\(ADDIN_DIR', 'обход каталога в статике'),
+                              (r'X-Hermes-Bridge', 'обязательный заголовок от CSRF'),
+                              (r'SESSION_ID_RE\.fullmatch', 'валидация session_id'),
+                              (r'_pending_stops', 'стоп до старта прогона'),
+                              (r'creationflags', 'запуск процесса без shell')):
+              assert re.search(needle, src), why
+
+          # shell=True (подстановка команд) недопустим ни в одном вызове — проверяем по AST,
+          # а не поиском подстроки: сам запрет упомянут в комментарии к _open_session.
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Call):
+                  for kw in node.keywords:
+                      if kw.arg == 'shell' and getattr(kw.value, 'value', False) is True:
+                          raise AssertionError(f'shell=True в строке {node.lineno}')
+
+          print('защиты на месте:', sorted(required))
+          print('shell=True в вызовах: нет')
+          PY

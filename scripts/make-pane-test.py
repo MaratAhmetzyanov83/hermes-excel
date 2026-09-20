@@ -3,7 +3,15 @@
 
 Смысл: панель ломается только внутри Excel, где свойства Range недоступны до load().
 Тест грузит НАСТОЯЩИЙ taskpane.html (та же разметка, тот же CSS, тот же taskpane.js) с моком,
-который ведёт себя так же строго. Запуск:  python scripts/make-pane-test.py
+который ведёт себя так же строго, и прогоняет сценарии записи в лист:
+
+  фаза 1 — запись в НЕПУСТОЙ диапазон с confirm → панель обязана спросить, а не писать молча;
+  фаза 2 — принудительная запись → снимок листа + предложение «Отменить» в тосте;
+  фаза 3 — нажатие «Отменить» → возврат прежнего содержимого (ещё одна запись в мок).
+
+Запуск:  python scripts/make-pane-test.py
+Проверка: headless Chrome --dump-dom https://localhost:3443/test-office.html
+          (режимы: ?mock=blank, ?mock=big, ?mock=nosync)
 """
 from pathlib import Path
 
@@ -14,26 +22,46 @@ OUT = ADDIN / "test-office.html"
 
 COLLECT = """
   <script>
-    // собираем результат после того, как панель отработала
-    setTimeout(function () {
+    // Панель на моке: гоняем сценарии записи и собираем результат в <pre id="testout">.
+    const OUT = {};
+    const toastText = () => {
+      const t = document.getElementById("toast");
+      return t && !t.classList.contains("hidden") ? t.textContent : "";
+    };
+    setTimeout(() => {                       // фаза 1: непустая цель → должно спросить
+      writeCsv("итог,значение\\nвсего,17", { confirm: true });
+    }, 1000);
+    setTimeout(() => {                       // фаза 2: фиксируем вопрос и пишем принудительно
+      OUT.confirmButtons = [...document.querySelectorAll(".acts button")].map((b) => b.textContent);
+      OUT.writesBeforeForce = (window.__writes || []).length;
+      writeCsv("итог,значение\\nвсего,17", { forced: true, quiet: true });
+    }, 1800);
+    setTimeout(() => {                       // фаза 3: нажимаем «Отменить»
+      OUT.toastBeforeUndo = toastText();
+      OUT.undoButton = !!document.querySelector(".toast-act");
+      OUT.writesAfterWrite = (window.__writes || []).length;
+      const undo = document.querySelector(".toast-act");
+      if (undo) undo.click();
+    }, 2600);
+    setTimeout(() => {                       // сбор итога
       const w = window.__writes || [];
-      const out = {
-        ctxLabel: (document.getElementById("ctxLabel") || {}).textContent || "",
-        selection: (document.getElementById("ctxCsv") || {}).value ? "прочитано" : "пусто",
-        csvHead: ((document.getElementById("ctxCsv") || {}).value || "").slice(0, 34),
-        suggestions: [...document.querySelectorAll(".sug b")].map((b) => b.textContent),
-        modelOptions: document.getElementById("modelSel") ? document.getElementById("modelSel").options.length : 0,
-        writeActions: [...document.querySelectorAll(".acts button")].map((b) => b.textContent),
-        toast: (document.getElementById("toast") && !document.getElementById("toast").classList.contains("hidden"))
-          ? document.getElementById("toast").textContent : "",
-        session: (document.getElementById("sessionInfo") || {}).textContent || "",
-        writes: w.map((x) => x.kind + "@" + x.address),
-      };
+      OUT.ctxLabel = (document.getElementById("ctxLabel") || {}).textContent || "";
+      OUT.selection = (document.getElementById("ctxCsv") || {}).value ? "прочитано" : "пусто";
+      OUT.csvHead = ((document.getElementById("ctxCsv") || {}).value || "").slice(0, 34);
+      OUT.ctxLines = ((document.getElementById("ctxCsv") || {}).value || "").split("\\n").length;
+      OUT.suggestions = [...document.querySelectorAll(".sug b")].map((b) => b.textContent);
+      OUT.modelOptions = document.getElementById("modelSel") ? document.getElementById("modelSel").options.length : 0;
+      OUT.previewBlocks = document.querySelectorAll(".preview pre.code").length;
+      OUT.writes = w.map((x) => x.kind + "@" + x.address);
+      OUT.restoredPayload = (w[w.length - 1] || {}).payload || null;
+      OUT.toastAfterUndo = toastText();
+      OUT.session = (document.getElementById("sessionInfo") || {}).textContent || "";
+      OUT.mock = window.__mock || {};
       const pre = document.createElement("pre");
       pre.id = "testout";
-      pre.textContent = JSON.stringify(out);
+      pre.textContent = JSON.stringify(OUT);
       document.body.appendChild(pre);
-    }, 3000);
+    }, 3400);
   </script>
 """
 

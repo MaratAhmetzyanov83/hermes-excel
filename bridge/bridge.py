@@ -8,6 +8,8 @@ Hermes Excel Bridge — локальный HTTPS-мост между надст�
                    и стримит события агента (текст, инструменты, результат) обратно в Excel по SSE
   * GET  /models — список провайдеров и моделей (из кэша моделей Hermes) для выпадающего списка
   * GET  /sessions — последние сессии Hermes (из state.db), чтобы продолжить любую из Excel
+  * GET  /session?id=<sid> — последние реплики сессии: панель восстанавливает ленту после
+                    перезапуска Excel, а не начинает с пустого чата
   * POST /open   — открыть ту же сессию в обычном Hermes (CLI), т.е. «продолжить в Hermes»
   * POST /stop   — прервать текущий прогон
 
@@ -28,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import unquote
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -57,17 +60,53 @@ FALLBACK_MODELS_CACHE = _HOME / "provider_models_cache.json"
 
 MAX_CONTEXT_ROWS = 400          # сколько строк выделения уходит модели
 MAX_CONTEXT_COLS = 60
+# Идентификатор сессии Hermes: 20260919_144821_ea810f. Валидируем перед подстановкой куда-либо.
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
+# Панель отвечает текстом и блоками ```csv/```formulas: браузер, картинки, cron и делегирование
+# ей не нужны. Узкий набор вдвое уменьшает промпт (схемы инструментов) и убирает круги
+# «попробовал инструмент — политика запретила». Расширяется через HERMES_BRIDGE_TOOLSETS.
+PANE_TOOLSETS = os.environ.get("HERMES_BRIDGE_TOOLSETS", "file")
+PANE_SKILLS = [s for s in os.environ.get("HERMES_BRIDGE_SKILLS", "excel-pane-contract").split(",") if s]
+# Бюджет прогона: на 80 % модель получает предупреждение и успевает свернуть работу.
+RUN_BUDGET = float(os.environ.get("HERMES_BRIDGE_RUN_BUDGET", "240"))
 RUN_TIMEOUT = float(os.environ.get("HERMES_BRIDGE_TIMEOUT", "1800"))
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)
+# Файлы запросов и рабочая папка прогонов — ВНЕ workspace: агент запускается с --in и видит файлы
+# вокруг себя, поэтому брошенные `.query-*.txt` прошлых ходов он принимал за текущую задачу
+# (наблюдалось: агент 60 с рассуждал о чужом промпте вместо своего).
+QUERY_DIR = Path(os.environ.get("TEMP") or os.environ.get("TMP") or str(WORKSPACE)) / "hermes-bridge"
+try:
+    QUERY_DIR.mkdir(parents=True, exist_ok=True)
+    for stale in QUERY_DIR.glob("*.txt"):
+        stale.unlink(missing_ok=True)
+except OSError:
+    QUERY_DIR = WORKSPACE
+PANE_DIR = WORKSPACE / "pane"
+PANE_DIR.mkdir(parents=True, exist_ok=True)
+for stale in WORKSPACE.glob(".query-*.txt"):                  # уборка с прошлых версий моста
+    stale.unlink(missing_ok=True)
 
-_runs: dict[str, subprocess.Popen] = {}
+_runs: dict[str, dict] = {}          # run_id -> {"proc": Popen, "session": str}
+_pending_stops: dict[str, float] = {}  # цель стопа, пришедшая раньше регистрации прогона
 _runs_lock = threading.Lock()
 _cfg_cache: dict[str, object] = {"at": 0.0, "default": {}}
 
 
 def log(*a: object) -> None:
-    print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+    """Пишет и в консоль, и в файл workspace/bridge.log.
+
+    Файл важен, когда мост поднимает сторож или ярлык автозапуска: окна нет, и без файла
+    диагностировать нечего (логи проверки в AGENTS.md читают именно workspace/bridge.log).
+    """
+    line = " ".join(str(x) for x in a)
+    stamped = f"{time.strftime('[%H:%M:%S]')} {line}"
+    print(stamped, flush=True)
+    try:
+        with (WORKSPACE / "bridge.log").open("a", encoding="utf-8") as f:
+            f.write(stamped + "\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- вспомогательное
@@ -122,6 +161,39 @@ def model_catalog() -> dict:
     return {"default": hermes_default(), "profile": PROFILE, "providers": providers}
 
 
+def session_messages(session_id: str, limit: int = 12) -> list[dict]:
+    """Последние реплики сессии — чтобы панель восстановила ленту чата после перезапуска Excel.
+
+    Только чтение; отдаём лишь роль и текст (служебные tool-сообщения пропускаем).
+    """
+    if not STATE_DB.exists() or not SESSION_ID_RE.fullmatch(session_id or ""):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """SELECT role, content, display_kind
+                 FROM messages
+                WHERE session_id = ? AND role IN ('user','assistant')
+                  AND COALESCE(active,1)=1
+                  AND content IS NOT NULL AND TRIM(content) <> ''
+                ORDER BY id DESC
+                LIMIT ?""",
+            (session_id, int(limit)),
+        ).fetchall()
+    except Exception as exc:                                  # noqa: BLE001
+        log("session_messages query failed:", exc)
+        return []
+    out: list[dict] = []
+    for r in reversed(rows):
+        text = str(r["content"] or "")
+        # В панель не нужно тащить служебные обёртки и служебные роли
+        if r["display_kind"] in ("system", "tool_call"):
+            continue
+        out.append({"role": r["role"], "text": text[:4000]})
+    return out
+
+
 def list_sessions(limit: int = 40) -> list[dict]:
     """Последние сессии из общего стора Hermes (только чтение)."""
     if not STATE_DB.exists():
@@ -145,6 +217,22 @@ def list_sessions(limit: int = 40) -> list[dict]:
         return []
 
 
+def error_hint(text: str) -> str:
+    """Что сделать пользователю по тексту сбоя. Пусто — подсказки нет."""
+    low = (text or "").lower()
+    if any(w in low for w in ("sign-in", "sign in", "oauth", "rejected your", "auth failed", "401", "403")):
+        return f"hermes -p {PROFILE} auth add <провайдер> --type oauth  (или выберите другую модель в панели)"
+    if "rate limit" in low or "429" in low or "quota" in low:
+        return "исчерпана квота или лимит — подождите минуту либо переключите модель в панели"
+    if any(w in low for w in ("too long", "context length", "maximum context")):
+        return "выделите меньший диапазон и повторите"
+    if any(w in low for w in ("timeout", "timed out", "budget")):
+        return "прогон прерван по времени — разбейте задачу на части"
+    if any(w in low for w in ("not found", "не найден")):
+        return f"проверьте провайдера и модель: hermes -p {PROFILE} config get model"
+    return ""
+
+
 def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
                 rng: str, shape: tuple[int, int] | None) -> str:
     """Собирает итоговый промпт: сначала контекст листа, затем задачу пользователя."""
@@ -164,6 +252,8 @@ def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
             "столбцы через запятую) либо блоком ```formulas с формулами Excel по одной в строке. "
             "Перед блоками кратко поясни вывод. Формулы пиши на английском (SUM, SUMIFS, XLOOKUP)."
         )
+        parts.append("Файл открыт в Excel прямо сейчас, данные выше — это и есть его содержимое: "
+                     "искать книгу на диске и проверять файлы не нужно.")
     elif empty:
         parts.append(
             f"[Контекст Excel] Файл: {file_name or 'неизвестно'} | Лист: {sheet or '—'} | "
@@ -203,19 +293,67 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _origin_ok(self) -> bool:
-        """Отсекаем чужие веб-страницы (CSRF на localhost), пускаем саму надстройку и CLI."""
+        """POST принимаем только от панели (или CLI).
+
+        Два независимых условия: (1) обязательный кастомный заголовок — его нельзя поставить «простым»
+        запросом из браузера без preflight, поэтому чужая страница мост не дёрнет; (2) если Origin
+        пришёл — он должен быть нашим. `null` (песочница <iframe sandbox>, data:, file:) запрещён:
+        раньше он пускался, и любая веб-страница могла запускать агента на этой машине.
+        """
+        if self.headers.get("X-Hermes-Bridge") != "1":
+            return False
         origin = self.headers.get("Origin")
         if origin is None:
             return True
-        return origin in (ORIGIN, ORIGIN.replace("localhost", "127.0.0.1"), "null")
+        return origin in (ORIGIN, ORIGIN.replace("localhost", "127.0.0.1"))
 
-    def _body(self) -> dict:
+    def _drain(self) -> None:
+        """Вычитать тело отклонённого запроса: иначе в keep-alive соединении оно станет
+        началом следующего запроса и сервер ответит 400 на корректный GET."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b"{}"
-            return json.loads(raw.decode("utf-8") or "{}")
+            if length > 0:
+                self.rfile.read(length)
         except Exception:                                     # noqa: BLE001
+            pass
+
+    def _body(self) -> dict:
+        """Тело запроса. Сбой разбора НЕ молчит: раньше `except: return {}` превращал кривое тело
+        в пустой запрос (панель присылала данные, а агент отвечал «данных нет» — и концов не найти)."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            log("body: непонятный Content-Length:", self.headers.get("Content-Length"))
             return {}
+        if not length:
+            return {}
+        try:
+            raw = self.rfile.read(length)
+        except Exception as exc:                              # noqa: BLE001
+            log("body: чтение не удалось:", exc)
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except Exception as exc:                              # noqa: BLE001
+            log(f"body: разбор JSON не удался ({exc}); первые 120 байт: {raw[:120]!r}")
+            self._body_failed = True
+            return {}
+
+    @staticmethod
+    def _safe_static(name: str) -> Path | None:
+        """Отдаём только файлы из addin/: ни `..`, ни абсолютных путей, ни выхода по symlink.
+
+        Раньше `ADDIN_DIR / name` резолвился по файловой системе, и `GET /assets/../../bridge/bridge.py`
+        отдавал исходники, а `GET /assets/../../../AppData/Local/hermes/state.db` — всю историю сессий.
+        """
+        if not name or name.startswith("/") or "\\\\" in name or ".." in name.split("/"):
+            return None
+        try:
+            candidate = (ADDIN_DIR / name).resolve()
+            candidate.relative_to(ADDIN_DIR.resolve())
+        except (OSError, ValueError):
+            return None
+        return candidate
 
     # ---- GET
     def do_GET(self) -> None:                                 # noqa: N802
@@ -237,13 +375,28 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 40
             self._json({"sessions": list_sessions(limit)})
             return
+        if path == "/session":
+            sid = ""
+            if "id=" in self.path:
+                sid = unquote(self.path.split("id=", 1)[1].split("&")[0])
+            if not SESSION_ID_RE.fullmatch(sid):
+                self._json({"error": "нужен параметр id=<session_id>"}, 400)
+                return
+            self._json({"session_id": sid, "messages": session_messages(sid)})
+            return
         if path in ("/", "/index.html", "/taskpane.html"):
             self._static(ADDIN_DIR / "taskpane.html", "text/html; charset=utf-8")
             return
         if path.startswith("/assets/") or path in ("/taskpane.js", "/taskpane.css", "/commands.html",
                                                    "/manifest.xml", "/test-office.html", "/mock-office.js"):
             name = path.lstrip("/")
-            target = ADDIN_DIR / ("manifest.xml" if name == "manifest.xml" else name)
+            if name == "manifest.xml":
+                name = "manifest.xml"
+            target = self._safe_static(name)
+            if target is None:
+                log("static: отказано в доступе", path)
+                self._json({"error": "forbidden", "path": path}, 403)
+                return
             ctype = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
                      ".png": "image/png", ".html": "text/html; charset=utf-8",
                      ".xml": "application/xml; charset=utf-8"}.get(
@@ -275,7 +428,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:                                # noqa: N802
         if not self._origin_ok():
-            self._json({"error": "forbidden origin"}, 403)
+            self._drain()
+            self._json({"error": "forbidden: нужен заголовок X-Hermes-Bridge: 1 и свой Origin"}, 403)
             return
         path = self.path.split("?")[0]
         if path == "/chat":
@@ -289,31 +443,55 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             self._json(self._open_session(str(body.get("session_id") or "")))
             return
+        self._drain()
         self._json({"error": "not found", "path": path}, 404)
 
     # ---- /chat: SSE-стрим ответа агента
     def _chat(self) -> None:
         body = self._body()
+        if getattr(self, "_body_failed", False):
+            # Тело не разобралось (например, клиент прислал кириллицу не в UTF-8). Раньше мост молча
+            # стартовал прогон с пустым промптом, и агент отвечал «данных нет» — вместо ошибки.
+            self._json({"error": "тело запроса не разобралось как UTF-8 JSON", "hint":
+                        "кодируйте тело в UTF-8 (curl: --data-binary @file.json)"}, 400)
+            return
         prompt = str(body.get("prompt") or "")
-        context = body.get("context") or {}
+        # Мусорные типы не должны ронять запрос до отправки ответа: раньше shape:[1,2,3]
+        # давал ValueError «too many values to unpack» и клиент получал оборванное соединение.
+        context = body.get("context")
+        if not isinstance(context, dict):
+            context = {}
+        shape_raw = body.get("shape")
+        shape = shape_raw if isinstance(shape_raw, list) and len(shape_raw) == 2 else None
         session_id = str(body.get("session_id") or "").strip()
         model = str(body.get("model") or "").strip()
         provider = str(body.get("provider") or "").strip()
         reasoning = str(body.get("reasoning") or "").strip()
-        max_turns = str(body.get("max_turns") or "40").strip()
+        try:
+            max_turns = str(max(1, min(200, int(body.get("max_turns") or 40))))
+        except (TypeError, ValueError):
+            max_turns = "40"
         query = build_query(prompt, context, str(body.get("file_name") or ""),
-                            str(body.get("sheet") or ""), str(body.get("range") or ""),
-                            body.get("shape") or None)
+                            str(body.get("sheet") or ""), str(body.get("range") or ""), shape)
 
         run_id = uuid.uuid4().hex[:8]
-        qfile = WORKSPACE / f".query-{run_id}.txt"
+        qfile = QUERY_DIR / f"query-{run_id}.txt"
         qfile.write_text(query, encoding="utf-8")
+        log(f"chat {run_id}: csv={'да' if context.get('csv') else 'нет'} "
+            f"empty={'да' if context.get('empty') else 'нет'} session={session_id or 'новый'} "
+            f"промпт={prompt[:60]!r} файл={qfile}")
 
         cmd = [HERMES]
         if PROFILE and PROFILE != "default":
             cmd += ["-p", PROFILE]
         cmd += ["chat", "-Q", "--format", "stream-json", "--query-file", str(qfile),
-                "--max-turns", max_turns, "--in", str(WORKSPACE)]
+                "--max-turns", max_turns, "--in", str(PANE_DIR)]
+        if PANE_TOOLSETS:
+            cmd += ["-t", PANE_TOOLSETS]
+        for skill in PANE_SKILLS:
+            cmd += ["-s", skill]
+        if RUN_BUDGET > 0:
+            cmd += ["--run-budget", str(int(RUN_BUDGET))]
 
         if session_id and session_id != "new":
             cmd += ["--resume", session_id]
@@ -343,10 +521,11 @@ class Handler(BaseHTTPRequestHandler):
 
         proc = None
         sid = session_id
+        watchdog = None
         try:
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(WORKSPACE),
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(PANE_DIR),
                     text=True, encoding="utf-8", errors="replace", bufsize=1,
                     env={**os.environ, "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1"},
                     creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
@@ -354,22 +533,33 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 sse("error", {"message": f"не найден исполняемый файл hermes ({HERMES})"})
                 sse("done", {"session_id": "", "exit_code": 127})
-                self._end_chunked()
                 return
 
+            # Регистрируем прогон сразу после старта процесса: стоп, нажатый до прихода
+            # события start, должен найти цель, а не промахнуться.
             with _runs_lock:
-                _runs[run_id] = proc
-            sse("start", {"run_id": run_id, "session_id": sid, "model": model or "auto",
-                          "provider": provider or "auto"})
+                _runs[run_id] = {"proc": proc, "session": session_id}
+                pending = run_id in _pending_stops or (session_id and session_id in _pending_stops)
+                if pending:
+                    _pending_stops.pop(run_id, None)
+                    _pending_stops.pop(session_id, None)
+            if pending:
+                self._kill(proc)
+                sse("error", {"message": "прогон остановлен до старта"})
+                return
 
-            deadline = time.time() + RUN_TIMEOUT
+            # Таймаут не может зависеть от вывода процесса: молчащий прогон (задумавшаяся модель,
+            # зависший инструмент) держал панель до получаса. Сторож убивает его сам.
+            watchdog = threading.Timer(RUN_TIMEOUT, self._on_timeout, args=(proc, run_id))
+            watchdog.daemon = True
+            watchdog.start()
+
+            sse("start", {"run_id": run_id, "session_id": sid, "model": model or "auto",
+                          "provider": provider or "auto", "timeout_s": int(RUN_TIMEOUT)})
+
             assert proc.stdout is not None
             for line in proc.stdout:
                 line = line.strip()
-                if time.time() > deadline:
-                    proc.kill()
-                    sse("error", {"message": "таймаут прогона"})
-                    break
                 if not line:
                     continue
                 try:
@@ -388,10 +578,20 @@ class Handler(BaseHTTPRequestHandler):
                                  "detail": evt.get("detail") or evt.get("input") or ""})
                 elif kind == "result":
                     sid = str(evt.get("session_id") or sid)
-                    sse("result", {"session_id": sid, "text": evt.get("text", ""),
-                                   "tokens": evt.get("tokens", {}),
-                                   "duration_ms": evt.get("duration_ms", 0),
-                                   "exit_code": evt.get("exit_code", 0)})
+                    code = int(evt.get("exit_code") or 0)
+                    if code != 0:
+                        # Служебный сбой — не ответ ассистента: панель покажет его как ошибку
+                        # с готовым действием, а не как текст модели (раньше так выглядела,
+                        # например, смерть OAuth-токена провайдера).
+                        text = str(evt.get("text") or "")
+                        sse("error", {"message": text or f"прогон завершился с кодом {code}",
+                                      "exit_code": code, "session_id": sid,
+                                      "hint": error_hint(text)})
+                    else:
+                        sse("result", {"session_id": sid, "text": evt.get("text", ""),
+                                       "tokens": evt.get("tokens", {}),
+                                       "duration_ms": evt.get("duration_ms", 0),
+                                       "exit_code": 0})
                 else:
                     sse("log", {"text": json.dumps(evt, ensure_ascii=False)[:400]})
 
@@ -411,6 +611,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:                                 # noqa: BLE001
                 pass
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             with _runs_lock:
                 _runs.pop(run_id, None)
             qfile.unlink(missing_ok=True)
@@ -420,6 +622,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _end_chunked(self) -> None:
+        """Терминатор chunked-потока ровно один раз: второй «0\\r\\n\\r\\n» оставался в keep-alive
+        соединении и разбирался как мусор в начале следующего запроса."""
+        if getattr(self, "_chunk_done", False):
+            return
+        self._chunk_done = True
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
@@ -435,25 +642,57 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:                                 # noqa: BLE001
                 pass
 
+    def _on_timeout(self, proc: subprocess.Popen, run_id: str) -> None:
+        """Сторож прогона: убивает процесс (и его детей) по истечении RUN_TIMEOUT."""
+        try:
+            if proc.poll() is None:
+                log(f"таймаут прогона {run_id} ({int(RUN_TIMEOUT)} с) — останавливаю процесс")
+                self._kill(proc)
+        except Exception:                                     # noqa: BLE001
+            pass
+
     def _stop(self, session_id: str, run_id: str) -> None:
+        """Останавливает ТОЛЬКО указанный прогон.
+
+        Раньше при переданном session_id без run_id условие убивало все записи в _runs, то есть
+        чужой прогон в другом окне Excel. Пустое тело не убивает ничего.
+        """
+        if not run_id and not session_id:
+            self._json({"ok": True, "killed": 0, "note": "нужен run_id или session_id"})
+            return
         killed = 0
         with _runs_lock:
-            for key, proc in list(_runs.items()):
-                if (run_id and key == run_id) or (session_id and not run_id) or (not run_id and not session_id):
-                    if proc.poll() is None:
-                        self._kill(proc)
-                        killed += 1
+            for key, rec in list(_runs.items()):
+                if run_id and key != run_id:
+                    continue
+                if not run_id and session_id and rec.get("session") != session_id:
+                    continue
+                proc = rec.get("proc")
+                if proc is not None and proc.poll() is None:
+                    self._kill(proc)
+                    killed += 1
+            if not killed:                                    # прогон ещё не зарегистрировался
+                _pending_stops[run_id or session_id] = time.time()
+                for stale, ts in list(_pending_stops.items()):
+                    if time.time() - ts > 300:
+                        _pending_stops.pop(stale, None)
         self._json({"ok": True, "killed": killed})
 
     def _open_session(self, session_id: str) -> dict:
-        """Открыть ту же сессию бота в обычном Hermes (новое окно консоли)."""
-        if not session_id:
-            return {"ok": False, "error": "empty session_id"}
-        flag = f" -p {PROFILE}" if PROFILE and PROFILE != "default" else ""
+        """Открыть ту же сессию бота в обычном Hermes (новое окно консоли).
+
+        Без shell: раньше строка вида `start "…" cmd /k "…" --resume {session_id}` собиралась
+        с shell=True, и session_id попадал в неё как есть — «zz & calc.exe» исполнялось.
+        """
+        if not SESSION_ID_RE.fullmatch(session_id or ""):
+            return {"ok": False, "error": "некорректный session_id"}
+        cmd = [HERMES]
+        if PROFILE and PROFILE != "default":
+            cmd += ["-p", PROFILE]
+        cmd += ["chat", "--resume", session_id]
         try:
-            subprocess.Popen(
-                f'start "Hermes {PROFILE}:{session_id}" cmd /k "{HERMES}"{flag} chat --resume {session_id}',
-                shell=True, cwd=str(WORKSPACE))
+            subprocess.Popen(cmd, cwd=str(WORKSPACE),
+                             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
             return {"ok": True, "session_id": session_id, "profile": PROFILE}
         except Exception as exc:                              # noqa: BLE001
             return {"ok": False, "error": str(exc)}

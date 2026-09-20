@@ -12,6 +12,10 @@ const state = {
   busy: false, controller: null, messages: [], bridgeOk: null,
   ctx: { csv: "", meta: {}, empty: false, anchor: "" },
   autoWrite: true, useCtx: true, tries: 0,
+  ctxDirty: false,          // пользователь правил CSV контекста руками — не затирать
+  frozen: null,             // цель записи, замороженная в момент отправки
+  lastWrite: null,          // снимок листа для «Отменить»
+  toolCount: 0, _raf: null, _status: null, _acc: "",
 };
 
 /* ------------------------------------------------------------------ утилиты */
@@ -39,15 +43,25 @@ function parseCsv(text) {
   return rows.filter((r) => r.some((c) => c !== ""));
 }
 
+function allBlocks(md) {
+  const out = [];
+  const re = /```([a-z]*)\s*\n([\s\S]*?)```/gi;
+  let m;
+  while ((m = re.exec(md))) {
+    const lang = (m[1] || "").toLowerCase();
+    const kind = ["csv", "tsv", "table"].includes(lang) ? "csv"
+      : ["formulas", "formula", "excel", "xl"].includes(lang) ? "formulas" : "other";
+    out.push({ lang: lang || "блок", kind, body: m[2].replace(/\s+$/, "") });
+  }
+  return out;
+}
+
+/* Первый блок каждого вида — для кнопок записи. ВАЖНО: раньше брался только первый блок в ответе,
+   и вторая таблица молча терялась. Теперь рядом есть и полный список (all) для превью. */
 function blocks(md) {
-  const grab = (langs) => {
-    for (const lang of langs) {
-      const m = md.match(new RegExp("```" + lang + "\\s*\\n([\\s\\S]*?)```", "i"));
-      if (m) return m[1].replace(/\s+$/, "");
-    }
-    return null;
-  };
-  return { csv: grab(["csv", "tsv", "table"]), formulas: grab(["formulas", "formula", "excel", "xl"]) };
+  const all = allBlocks(md);
+  const pick = (kind) => (all.find((b) => b.kind === kind) || {}).body || null;
+  return { csv: pick("csv"), formulas: pick("formulas"), all };
 }
 
 /* текст ответа без служебных блоков — для показа в чате */
@@ -56,12 +70,21 @@ function stripBlocks(md) {
 }
 
 let toastTimer = null;
-function toast(text, bad) {
+/* Тост с необязательным действием (кнопка): нужен для «Записано … · Отменить» —
+   без отката любая запись в лист тревожит пользователя. */
+function toast(text, bad, action) {
   const el = $("toast");
   el.textContent = text;
   el.className = "toast" + (bad ? " bad" : "");
+  if (action) {
+    const b = document.createElement("button");
+    b.className = "toast-act";
+    b.textContent = action.label;
+    b.onclick = () => { el.classList.add("hidden"); action.fn(); };
+    el.appendChild(b);
+  }
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add("hidden"), bad ? 5000 : 2600);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), action ? 10000 : (bad ? 5000 : 2600));
 }
 
 function storageKey() { return "hermes.session." + (state.workbook || "default"); }
@@ -116,7 +139,58 @@ function addMessage(role, text) {
   return wrap;
 }
 
-function scrollDown() { $("chat").scrollTop = $("chat").scrollHeight; }
+/* Автопрокрутка только когда пользователь у нижнего края: иначе чтение длинного ответа
+   постоянно сбивается вниз. */
+function scrollDown(force) {
+  const c = $("chat");
+  const near = c.scrollHeight - c.scrollTop - c.clientHeight < 90;
+  if (force || near) c.scrollTop = c.scrollHeight;
+}
+
+/* Статус хода с первой секунды: до первого текста модель молчит, и панель выглядела зависшей. */
+function startStatus(bubble, t0) {
+  const meta = bubble.querySelector(".who .meta");
+  state.toolCount = 0;
+  const tick = () => {
+    const s = ((Date.now() - t0) / 1000).toFixed(0);
+    if (meta) meta.textContent = ` · ${s} с · ${state.toolCount} инстр.`;
+  };
+  tick();
+  state._status = setInterval(tick, 1000);
+}
+
+function stopStatus() {
+  if (state._status) { clearInterval(state._status); state._status = null; }
+}
+
+/* Отрисовка дельт не чаще одного кадра: на каждый токен шло два regex по всему тексту и форс-layout. */
+function renderDelta(bubble, text) {
+  state._acc = text;
+  if (state._raf) return;
+  state._raf = requestAnimationFrame(() => {
+    state._raf = null;
+    bubble.querySelector(".body").textContent = stripBlocks(state._acc);
+    scrollDown();
+  });
+}
+
+function previewBlocks(bubble, all) {
+  if (!all || !all.length) return;
+  const box = document.createElement("div");
+  box.className = "preview";
+  all.forEach((blk) => {
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    const lines = blk.body.split("\n").length;
+    cap.textContent = `\`\`\`${blk.lang} · ${lines} строк — это уедет в лист`;
+    const pre = document.createElement("pre");
+    pre.className = "code";
+    pre.textContent = blk.body.length > 1400 ? blk.body.slice(0, 1400) + "\n…" : blk.body;
+    box.appendChild(cap);
+    box.appendChild(pre);
+  });
+  bubble.appendChild(box);
+}
 
 function showTyping() {
   const t = document.createElement("div");
@@ -165,11 +239,11 @@ async function readSelection() {
       meta: { sheet: sheet.name, range: target.address, shape: [grid.length, (grid[0] || []).length], note },
       empty: blank, anchor,
     };
-    $("ctxCsv").value = state.ctx.csv;
+    if (!state.ctxDirty) $("ctxCsv").value = state.ctx.csv;   // ручные правки не затираем
     $("ctxLabel").textContent = `${state.ctx.meta.sheet}!${target.address.replace(/^.*!/, "")}`
       + (blank ? " · пусто" : "") + (note ? " · " + note : "");
     const saved = localStorage.getItem(storageKey());
-    if (saved && !state.sessionId) setSession(saved);
+    if (saved && !state.sessionId) { setSession(saved); loadHistory(); }
     if (!$("chat").querySelector(".msg")) emptyState();
   });
 }
@@ -180,8 +254,23 @@ async function withSheet(fn) {
   catch (e) { toast("Ошибка Excel: " + (e.message || e), true); }
 }
 
+/* Цель записи замораживается в момент ОТПРАВКИ запроса: ход длится секунды-минуты, а пользователь
+   за это время ходит по листу, и без снимка результат приземлялся поверх чужих данных. */
+function freezeTarget() {
+  state.frozen = {
+    anchor: state.ctx.anchor,
+    sheet: state.ctx.meta.sheet || "",
+    empty: !!state.ctx.empty,
+  };
+}
+
+function targetAddress() {
+  const f = state.frozen || {};
+  return f.anchor || state.ctx.anchor || "";
+}
+
 function anchorCell(ctx) {
-  const addr = state.ctx.anchor;
+  const addr = targetAddress();
   if (addr && addr.includes("!")) {
     const sheet = addr.split("!")[0].replace(/^'|'$/g, "");
     const cell = addr.split("!")[1];
@@ -190,30 +279,81 @@ function anchorCell(ctx) {
   return ctx.workbook.getActiveCell();
 }
 
-function writeGrid(grid, asFormulas) {
+function writeGrid(grid, asFormulas, opts) {
   const rows = grid.length;
   const cols = Math.max(...grid.map((r) => r.length));
+  const o = opts || {};
   withSheet(async (ctx) => {
     const rng = anchorCell(ctx).getResizedRange(rows - 1, cols - 1);
+    rng.load("address,values,formulas");                  // узнаём, что там лежит СЕЙЧАС
+    await ctx.sync();
+    const prevValues = rng.values || [];
+    const prevFormulas = rng.formulas || [];
+    const busy = prevValues.some((r) => (r || []).some((c) => c !== "" && c !== null));
+    if (busy && o.confirm && !o.forced && !o.quiet) {
+      askOverwrite(rng.address, grid, asFormulas, rows, cols);   // не пишем молча поверх данных
+      return;
+    }
     if (asFormulas) rng.formulas = grid; else rng.values = grid;
     await ctx.sync();
-    toast(`Записано ${rows}×${cols} в ${state.ctx.meta.sheet || ""}!${(state.ctx.anchor || "").split("!")[1] || "активную ячейку"}`);
+    state.lastWrite = { address: rng.address, values: prevValues, formulas: prevFormulas, rows, cols };
+    toast(`Записано ${rows}×${cols} в ${rng.address}`, false,
+          { label: "Отменить", fn: undoWrite });
   });
 }
 
-function writeCsv(csv) {
+/* Что вернуть при отмене: формулу там, где была формула, значение — где было значение. */
+function undoWrite() {
+  const lw = state.lastWrite;
+  if (!lw) { toast("Отменять нечего", true); return; }
+  state.lastWrite = null;
+  withSheet(async (ctx) => {
+    const rng = ctx.workbook.worksheets.getActiveWorksheet().getRange(lw.address);
+    const back = (lw.values || []).map((row, i) => (row || []).map(
+      (v, j) => ((lw.formulas || [])[i] || [])[j] || v));
+    if (back.length) { rng.formulas = back; await ctx.sync(); }
+    toast("Запись отменена — в листе снова как было");
+  });
+}
+
+function askOverwrite(address, grid, asFormulas, rows, cols) {
+  const wrap = addMessage("assistant", `В ${address} уже есть данные. Записывать поверх?`);
+  const acts = document.createElement("div");
+  acts.className = "acts";
+  const mk = (label, fn) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.onclick = () => { acts.remove(); fn(); };
+    acts.appendChild(b);
+  };
+  mk(`перезаписать ${rows}×${cols}`, () => writeGrid(grid, asFormulas, { forced: true, quiet: true }));
+  mk("записать в текущее выделение", () => {
+    state.frozen = null;                                   // пишем туда, где курсор сейчас
+    withSheet(async (ctx) => {
+      const rng = ctx.workbook.getSelectedRange().getCell(0, 0).getResizedRange(rows - 1, cols - 1);
+      if (asFormulas) rng.formulas = grid; else rng.values = grid;
+      await ctx.sync();
+      toast(`Записано ${rows}×${cols} в ${rng.address}`);
+    });
+  });
+  mk("не писать", () => toast("Оставил лист как есть"));
+  wrap.appendChild(acts);
+  scrollDown(true);
+}
+
+function writeCsv(csv, opts) {
   const rows = parseCsv(csv || "");
   if (!rows.length) return false;
   const w = Math.max(...rows.map((r) => r.length));
-  writeGrid(rows.map((r) => { const c = r.slice(); while (c.length < w) c.push(""); return c; }), false);
+  writeGrid(rows.map((r) => { const c = r.slice(); while (c.length < w) c.push(""); return c; }), false, opts);
   return true;
 }
 
-function writeFormulas(block) {
+function writeFormulas(block, opts) {
   const lines = (block || "").split("\n").map((s) => s.trim()).filter(Boolean)
     .map((s) => [s.replace(/^`|`$/g, "")]);
   if (!lines.length) return false;
-  writeGrid(lines, true);
+  writeGrid(lines, true, opts);
   return true;
 }
 
@@ -282,6 +422,25 @@ async function loadSessions() {
   } catch (e) { /* мост молчит */ }
 }
 
+/* Лента чата после перезапуска Excel: сессия на книгу сохранена, но панель начинала с пустого
+   экрана, и «что я тут делал вчера» приходилось вспоминать через CLI. */
+async function loadHistory() {
+  if (!state.sessionId) return;
+  try {
+    const r = await fetch(BASE + "/session?id=" + encodeURIComponent(state.sessionId), { cache: "no-store" });
+    const d = await r.json();
+    const msgs = d.messages || [];
+    if (!msgs.length) return;
+    const chat = $("chat");
+    chat.innerHTML = "";
+    msgs.forEach((m) => {
+      const el = addMessage(m.role === "user" ? "user" : "assistant", stripBlocks(m.text) || m.text);
+      el.classList.add("old");
+    });
+    scrollDown(true);
+  } catch (e) { /* мост молчит — не мешаем работать */ }
+}
+
 function setSession(id) {
   state.sessionId = id || "";
   if (id) localStorage.setItem(storageKey(), id); else localStorage.removeItem(storageKey());
@@ -314,7 +473,8 @@ async function send() {
   autoGrow();
   if (!$("chat").querySelector(".msg")) $("chat").innerHTML = "";
   addMessage("user", prompt);
-  state.busy = true; state.runId = null;
+  freezeTarget();                                  // пишем туда, где было выделено при отправке
+  state.busy = true; state.runId = null; state.toolCount = 0;
   $("btnSend").classList.add("hidden"); $("btnStop").classList.remove("hidden");
   showTyping();
 
@@ -347,20 +507,26 @@ async function send() {
         const kind = ev[1].trim();
         if (kind === "start") {
           state.runId = data.run_id;
+          hideTyping();
+          bubble = addMessage("assistant", "");
+          bubble.classList.add("working");
+          startStatus(bubble, t0);                       // видно, что работа идёт, ещё до первого текста
         } else if (kind === "session") {
           setSession(data.session_id);
         } else if (kind === "delta") {
           acc += data.text || "";
-          if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); }
-          bubble.querySelector(".body").textContent = stripBlocks(acc);
-          scrollDown();
+          if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); startStatus(bubble, t0); }
+          bubble.classList.remove("working");
+          renderDelta(bubble, acc);
         } else if (kind === "tool" || kind === "log") {
-          if (bubble) {
-            let tl = bubble.querySelector(".tools");
-            if (!tl) { tl = document.createElement("div"); tl.className = "tools"; bubble.appendChild(tl); }
-            tl.textContent += (tl.textContent ? "\n" : "") + "▸ " + (data.name || "log") +
-              (data.detail ? " — " + String(data.detail).slice(0, 90) : "");
-          }
+          // Инструменты пишем всегда, а не только после первого текста: именно они показывают,
+          // что агент жив, когда модель «думает» десятки секунд.
+          if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); startStatus(bubble, t0); }
+          state.toolCount = (state.toolCount || 0) + (kind === "tool" ? 1 : 0);
+          let tl = bubble.querySelector(".tools");
+          if (!tl) { tl = document.createElement("div"); tl.className = "tools"; bubble.appendChild(tl); }
+          tl.textContent += (tl.textContent ? "\n" : "") + "▸ " + (data.name || "log") +
+            (data.detail ? " — " + String(data.detail).slice(0, 90) : "");
         } else if (kind === "result") {
           if (data.text) {
             acc = data.text;
@@ -369,36 +535,57 @@ async function send() {
           }
           setSession(data.session_id || state.sessionId);
         } else if (kind === "error") {
-          toast(data.message || "ошибка моста", true);
+          hideTyping(); stopStatus();
+          const b = addMessage("assistant", data.message || "ошибка моста");
+          b.classList.add("failed");
+          if (data.hint) {
+            const h = document.createElement("div");
+            h.className = "hint";
+            h.title = "нажмите, чтобы скопировать";
+            h.textContent = data.hint;
+            h.onclick = () => { navigator.clipboard.writeText(data.hint); toast("команда скопирована"); };
+            b.appendChild(h);
+          }
+          bubble = null;
         } else if (kind === "done") {
-          hideTyping();
+          hideTyping(); stopStatus();
           if (!bubble) bubble = addMessage("assistant", acc ? stripBlocks(acc) : "(пустой ответ)");
           const who = bubble.querySelector(".who .meta");
-          if (who) who.textContent = ` · ${((Date.now() - t0) / 1000).toFixed(1)} с`;
+          if (who) who.textContent = ` · ${((Date.now() - t0) / 1000).toFixed(1)} с`
+            + (state.toolCount ? ` · ${state.toolCount} инстр.` : "");
+          bubble.classList.remove("working");
           bubble.classList.add("done");
           const b = blocks(acc);
+          previewBlocks(bubble, b.all);                   // что именно уедет в лист — до записи
+          const acts = document.createElement("div");
+          acts.className = "acts";
+          const mk = (label, fn) => {
+            const btn = document.createElement("button");
+            btn.textContent = label;
+            btn.onclick = fn;
+            acts.appendChild(btn);
+          };
           if (b.csv || b.formulas) {
-            const acts = document.createElement("div");
-            acts.className = "acts";
-            const mk = (label, fn) => {
-              const btn = document.createElement("button");
-              btn.textContent = label;
-              btn.onclick = fn;
-              acts.appendChild(btn);
-            };
-            if (b.csv) mk("записать таблицу в лист", () => writeCsv(b.csv));
-            if (b.formulas) mk("записать формулы", () => writeFormulas(b.formulas));
+            if (b.csv) mk("записать таблицу в лист", () => writeCsv(b.csv, { quiet: true }));
+            if (b.formulas) mk("записать формулы", () => writeFormulas(b.formulas, { quiet: true }));
             mk("вставить текст в ячейку", () => {
               withSheet(async (ctx) => {
                 anchorCell(ctx).values = [[stripBlocks(acc) || acc]];
                 await ctx.sync(); toast("текст записан");
               });
             });
-            bubble.appendChild(acts);
-            if (state.autoWrite) {
-              if (b.csv) writeCsv(b.csv);
-              else writeFormulas(b.formulas);
-            }
+          }
+          if (acc) mk("скопировать ответ", () => {
+            navigator.clipboard.writeText(stripBlocks(acc) || acc); toast("ответ скопирован");
+          });
+          if (b.csv) mk("скопировать CSV", () => {
+            navigator.clipboard.writeText(b.csv); toast("CSV скопирован");
+          });
+          bubble.appendChild(acts);
+          if (state.autoWrite) {
+            // confirm: не затираем непустой диапазон молча — панель спросит и предложит вариант
+            if (b.csv) writeCsv(b.csv, { confirm: true });
+            else if (b.formulas) writeFormulas(b.formulas, { confirm: true });
           }
           loadSessions();
         }
@@ -412,6 +599,7 @@ async function send() {
     }
   } finally {
     state.busy = false; state.controller = null;
+    stopStatus();
     $("btnSend").classList.remove("hidden"); $("btnStop").classList.add("hidden");
   }
 }
@@ -460,9 +648,21 @@ function wire() {
     toast("Новый чат");
   };
   $("btnSettings").onclick = () => $("settings").classList.toggle("hidden");
-  $("btnRefresh").onclick = () => readSelection().then(() => toast("Выделение обновлено")).catch((e) => toast(e.message, true));
+  $("btnRefresh").onclick = () => { state.ctxDirty = false; readSelection().then(() => toast("Выделение обновлено")).catch((e) => toast(e.message, true)); };
   $("btnEditCtx").onclick = () => $("ctxEdit").classList.toggle("hidden");
   $("btnCtxDone").onclick = () => { $("ctxEdit").classList.add("hidden"); toast("Данные для контекста обновлены"); };
+  $("ctxCsv").addEventListener("input", () => { state.ctxDirty = true; });   // правки не теряются
+  // чип контекста — переключатель: решение «брать выделение или нет» принимается на каждой реплике,
+  // а тумблер в настройках для этого слишком далеко
+  $("ctxLabel").title = "нажмите, чтобы включать/выключать контекст выделения";
+  $("ctxLabel").style.cursor = "pointer";
+  $("ctxLabel").onclick = () => {
+    state.useCtx = !state.useCtx;
+    $("useCtx").checked = state.useCtx;
+    localStorage.setItem("hermes.usectx", state.useCtx ? "1" : "0");
+    $("ctxLabel").classList.toggle("off", !state.useCtx);
+    toast(state.useCtx ? "Контекст выделения включён" : "Контекст выделения выключен");
+  };
   $("modelSel").onchange = () => localStorage.setItem("hermes.model", $("modelSel").value);
   $("providerSel").onchange = () => {
     localStorage.setItem("hermes.provider", $("providerSel").value);
@@ -470,7 +670,7 @@ function wire() {
   };
   $("sessionPick").onchange = () => {
     const v = $("sessionPick").value;
-    if (v) { setSession(v); toast("Продолжаю чат " + v); }
+    if (v) { setSession(v); loadHistory(); toast("Продолжаю чат " + v); }
   };
   $("prompt").addEventListener("input", autoGrow);
   $("prompt").addEventListener("keydown", (e) => {
@@ -494,7 +694,7 @@ async function boot(isOffice) {
   loadSessions();
   if (state.office) {
     const saved = localStorage.getItem(storageKey());
-    if (saved) setSession(saved);
+    if (saved) { setSession(saved); loadHistory(); }
     try {
       Office.context.document.addHandlerAsync(Office.EventType.DocumentSelectionChanged, () => {
         clearTimeout(state._t);
