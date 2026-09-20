@@ -70,6 +70,26 @@ Excel (Office.js task pane)  ──HTTPS+SSE──►  bridge.py (localhost:3443
 
 ## Запуск
 
+### Новая машина — одна команда
+
+```powershell
+git clone https://github.com/MaratAhmetzyanov83/hermes-excel.git "$env:USERPROFILE\hermes-excel"
+cd "$env:USERPROFILE\hermes-excel"
+.\install.cmd            # сертификаты → бот → сайлоад → сторож → мост → doctor
+.\doctor.cmd             # таблица проверок с командами-исправлениями
+```
+
+Установка идемпотентна: повторный запуск ничего не ломает и ничего не переделывает.
+`install.cmd -DryRun` — показать план; `-Profile <имя>` — другое имя бота; `-NoBridge` — без сторожа.
+Если сертификата нет и Node не установлен, установщик выдаст его через `openssl` из git-bash и добавит
+в доверенные корни — **Node не обязателен**. Снять всё: `scripts\uninstall.ps1`.
+
+Агенту, которого вы отправите настраивать другую машину, достаточно сказать:
+«склонируй https://github.com/MaratAhmetzyanov83/hermes-excel и выполни install.cmd, затем doctor.cmd;
+инструкция — в AGENTS.md» — там же грабли и порядок проверки.
+
+### Те же шаги вручную
+
 ```bash
 # 1. Сертификаты для https://localhost (один раз)
 npx --yes office-addin-dev-certs install --days 365

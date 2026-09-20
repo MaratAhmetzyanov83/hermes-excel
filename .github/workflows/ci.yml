@@ -82,6 +82,31 @@ jobs:
           print('сценарии записи в тесте на месте')
           PY
 
+      - name: Установщик и удаление на месте (защиты от известных грабель)
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          need = {
+              'install.cmd': ['scripts\\install.ps1'],
+              'scripts/install.ps1': ['Resolve-Python', 'DryRun', 'WindowsApps',
+                                      'hermes', 'profile', 'create', '--clone', 'install-watchdog.ps1'],
+              'scripts/uninstall.ps1': ['DryRun', 'profile delete', '-y', 'purge-identity',
+                                        'install-watchdog.ps1', '-Remove'],
+              'scripts/bridge-watchdog.ps1': ['watchdog.lock', 'Test-Bridge', 'WindowsApps'],
+          }
+          bad = []
+          for path, needles in need.items():
+              f = pathlib.Path(path)
+              if not f.exists():
+                  bad.append(f'{path}: нет файла'); continue
+              text = f.read_text(encoding='utf-8', errors='ignore')
+              for n in needles:
+                  if n not in text:
+                      bad.append(f'{path}: нет «{n}»')
+          print('проблемы:', bad or 'нет')
+          sys.exit(1 if bad else 0)
+          PY
+
       - name: Книга авто-открытия ссылается на тот же Id, что манифест
         run: |
           python scripts/auto-open-workbook.py create

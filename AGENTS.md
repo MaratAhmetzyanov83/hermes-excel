@@ -4,6 +4,20 @@
 на машину пользователя. Выполняй шаги по порядку и **проверяй каждый** — процедура ниже проверена
 на живой Windows-машине, включая все грабли из раздела «Грабли».
 
+## Быстрый путь на новой машине
+
+```bash
+git clone https://github.com/MaratAhmetzyanov83/hermes-excel.git "$USERPROFILE/hermes-excel"
+cd "$USERPROFILE/hermes-excel"
+install.cmd            # сертификаты → бот → сайлоад → сторож → мост → doctor, идемпотентно
+doctor.cmd             # таблица проверок с готовыми командами-исправлениями
+```
+
+`install.cmd -DryRun` показывает план, ничего не меняя; `-Profile <имя>` задаёт имя бота;
+`-NoBridge` пропускает сторожа. Снять всё: `scripts\uninstall.ps1` (удаление идемпотентно).
+Если сертификата нет и нет Node, установщик выдаст его через `openssl` из git-bash и добавит
+в доверенные корни — Node для установки не обязателен.
+
 ## Что это такое
 
 Надстройка Excel (Office.js), внутри которой работает агент Hermes: панель-чат в задачной области Excel,
@@ -59,6 +73,11 @@ start-bridge.cmd          # или: python bridge/bridge.py
 
 ## Проверка установки (по шагам, каждая команда с ожидаемым результатом)
 
+**Сначала просто запусти `doctor.cmd`** — он проверяет всё это разом (мост, бот, сторож, сертификаты,
+реестр, книгу, BOM, python, Excel) и печатает `PASS/WARN/FAIL` с готовой командой-исправлением
+(машиночитаемо: `doctor.ps1 -Json`; поднять мост заодно: `doctor.cmd fix`). Шаги ниже — то же самое
+вручную, когда нужно понять, где именно порвалось.
+
 ```bash
 # 1. Мост жив и смотрит в нужный профиль
 curl -s --ssl-no-revoke https://localhost:3443/health
@@ -86,10 +105,25 @@ python scripts/make-pane-test.py
 #    ожидаем: ctxLabel = "<Лист>!<диапазон>", toast = "", modelOptions > 0, suggestions непустые
 
 # 6. Диалог end-to-end (создаст сессию в сторе бота)
-curl -sN --ssl-no-revoke -X POST -H "Content-Type: application/json" \
-  -d '{"prompt":"Сколько строк данных?","model":"auto","context":{"csv":"a,b\n1,2\n3,4"}}' \
-  https://localhost:3443/chat | grep -E "^event: (result|done)" -A1
+#    POST-эндпоинты требуют заголовок X-Hermes-Bridge: 1 (защита от CSRF), тело — строго UTF-8.
+#    Кириллица в `curl -d` из git-bash уезжает в cp1251 → мост отвечает 400. Пишите тело в файл.
+python - <<'PY'
+import json, pathlib
+pathlib.Path("workspace/q.json").write_text(json.dumps(
+    {"prompt": "Сколько строк данных?", "model": "auto", "context": {"csv": "a,b\n1,2\n3,4"}}),
+    encoding="utf-8")
+PY
+curl -sN --ssl-no-revoke -X POST -H "Content-Type: application/json" -H "X-Hermes-Bridge: 1" \
+  --data-binary @workspace/q.json https://localhost:3443/chat | grep -E "^event: (result|done)" -A1
 hermes -p excel sessions list --limit 3     # та же сессия видна в сторе бота
+
+# 6b. Регрессии моста без Excel: обход каталога, инъекция в /open, CSRF, мусорное тело,
+#     адресный стоп — 13 проверок
+python scripts/test-bridge-security.py
+
+# 6c. Панель: оффлайн-тест на строгом моке Office.js, включая сценарии записи в лист
+python scripts/make-pane-test.py
+#    затем в headless Chrome: /test-office.html (режимы ?mock=blank, ?mock=big, ?mock=nosync)
 
 # 7. Панель реально открылась внутри Excel (по логу моста)
 grep -a "taskpane.html" workspace/bridge.log
@@ -111,10 +145,19 @@ grep -a "taskpane.html" workspace/bridge.log
 | `scripts/make-pane-test.py` | генерирует `addin/test-office.html` из настоящего `taskpane.html` |
 | `scripts/auto-open-workbook.py` | книга, которая сама открывает панель (`create` / `tag`) |
 | `scripts/sideload.ps1` | регистрация в реестре + сборка авто-открывающей книги |
-| `scripts/autostart-install.ps1` | (опц.) запуск моста при входе в Windows |
+| `scripts/install.ps1` / `install.cmd` | установка одной командой (идемпотентно), `-DryRun`, `-Profile`, `-NoBridge` |
+| `scripts/uninstall.ps1` | снятие всего, что поставил install (`-Profile` — удалить и бота, `-Purge` — и workspace, `-DryRun`) |
+| `scripts/bridge-watchdog.ps1` | сторож: поднимает мост, если тот не отвечает (раз в минуту + при входе в Windows) |
+| `scripts/install-watchdog.ps1` | ставит/снимает сторожа, `-Status` |
+| `scripts/doctor.ps1` / `doctor.cmd` | проверка надстройки одной командой (11 пунктов), `-Json`, `-Fix` |
+| `scripts/test-bridge-security.py` | регрессии моста: обход каталога, инъекция, CSRF, адресный стоп (13 проверок) |
+| `scripts/check-workbook.py` | книга авто-открытия: части webextensions и совпадение Id с манифестом |
+| `scripts/bench-turn.py`, `scripts/bench-bot.py` | замер хода и разбор прогона по событиям |
+| `scripts/autostart-install.ps1` | (устарело) автозапуск ярлыком — заменён сторожем |
 | `scripts/make-icons.py` | иконки 16/32/64/80 (нужен Pillow) |
-| `start-bridge.cmd` | `start-bridge.cmd` — старт, `start-bridge.cmd stop` — остановка |
-| `workspace/` | рабочая папка агента и логи (в git не попадает) |
+| `start-bridge.cmd` | `start` (по умолчанию), `stop`, `status`, `excel` (мост + Excel с авто-открывающей книгой) |
+| `.github/workflows/ci.yml` | CI: манифест, BOM у `.ps1`, синтаксис Python, скан секретов, сверка Id книги, защиты моста по AST |
+| `workspace/` | рабочая папка агента и логи (`bridge.log`, `watchdog.log`) (в git не попадает) |
 
 ## Грабли (все встречены вживую — не наступай снова)
 
@@ -151,6 +194,31 @@ grep -a "taskpane.html" workspace/bridge.log
 11. **Пустое выделение — частый реальный случай.** Мост получает `context.empty` и подсказывает модели:
     «данных нет, не задавай уточняющих вопросов, верни результат блоком ```csv». Без этого модель
     отвечает встречным вопросом, и пользователь думает, что «оно не работает».
+12. **`python` из PATH на Windows — часто заглушка Microsoft Store** (`…\WindowsApps\python.exe`):
+    печатает «Python» и выходит, мост не поднимается, в логе ошибок ровно строка `Python`. Ищите
+    интерпретатор перебором кандидатов (venv Hermes → проект → PATH кроме `WindowsApps` → `py -3`)
+    и **проверяйте кандидата запуском**, а не наличием файла.
+13. **Автозапуск ярлыком срабатывает один раз при входе в Windows.** Мост упал позже — панель навсегда
+    против мёртвого сервера. Нужен сторож: задача планировщика раз в минуту (`schtasks /SC MINUTE /MO 1`),
+    ярлык автозагрузки вызывает его же с `-Force` (мгновенный старт при входе).
+14. **Не сторожите сторож именованным мьютексом.** Один зависший запуск (у нас — `Start-Process` с
+    `-RedirectStandardOutput` на процессе, который не отдал поток) держал мьютекс, и все следующие
+    запуски молча выходили: лог пуст, мост лежит. Замок-файл со «старением» (3 минуты) самовосстанавливается.
+    И не перенаправляйте потоки дочернего процесса — пусть мост пишет свой лог (`workspace/bridge.log`).
+15. **Кириллица в `curl -d` из git-bash уезжает в cp1251** (`\xf1\xf3\xec\xec\xfb` = «суммы»),
+    `json.loads` в мосте падает, и при `except: return {}` прогон стартовал с ПУСТЫМ промптом —
+    агент честно отвечал «данных нет», а виноват был тест. Мост теперь отвечает `400` и пишет в лог
+    первые байты; тела для проверок пишите в файл и передавайте `--data-binary @file.json`.
+16. **`write_file` сам добавляет UTF-8 BOM для `.ps1`.** Если добавить BOM ещё раз, PowerShell 5.1
+    падает на первой строке (`?# : не является именем командлета`). Нормализация: снять все ведущие BOM
+    и добавить ровно один (utf-8-sig + CRLF).
+17. **PowerShell 5.1 не видит тип `System.IO.Compression.ZipArchiveMode`** (не резолвится даже после
+    `Add-Type`), а `ZipFile::OpenRead` не открывает `.xlsx`, который держит Excel. Разбор архива отдайте
+    Python (`scripts/check-workbook.py`). И выставляйте `[Console]::OutputEncoding = UTF8`, иначе
+    кириллица в консоли и в `-Json` уходит в cp866 и разбирается криво.
+18. **Интерактивные подтверждения вешают агента.** `hermes profile delete <имя>` без `-y` спрашивает
+    «Type '<имя>' to confirm» и ждёт ввода — в скриптах добавляйте `-y`, а после удаления
+    `hermes profile purge-identity <имя>` (иначе остаётся «хвост» сессий/маршрутизации).
 
 ## Если `git push` не проходит (TLS/VPN)
 
@@ -186,8 +254,11 @@ done
 ## Удаление
 
 ```bash
-powershell -NoProfile -Command "Remove-ItemProperty 'HKCU:\Software\Microsoft\Office\16.0\WEF\Developer' -Name '<addin-id>'; Remove-Item -Recurse -Force 'HKCU:\Software\Microsoft\Office\16.0\Wef\TrustedCatalogs\{9F5D2C41-7A83-4E1B-9C0D-1E2F3A4B5C6D}' -ErrorAction SilentlyContinue"
-start-bridge.cmd stop
-rm "$APPDATA/Microsoft/Windows/Start Menu/Programs/Startup/Hermes Excel Bridge.lnk"   # если ставили автозапуск
-hermes profile delete excel                                                            # удалит бота и его сессии
+scripts\uninstall.ps1                 # снимает задачу, ярлык, запись в реестре, останавливает мост
+scripts\uninstall.ps1 -Profile excel  # плюс бот вместе с его сессиями
+scripts\uninstall.ps1 -Purge          # плюс workspace (книги, логи, файлы агента)
+scripts\uninstall.ps1 -DryRun         # показать план, ничего не трогая
 ```
+
+Идемпотентно: повторный запуск ничего не ломает. Сертификат `https://localhost` не удаляется — им могут
+пользоваться другие надстройки. После этого повторная установка — `install.cmd`.
