@@ -93,6 +93,8 @@ jobs:
               'scripts/uninstall.ps1': ['DryRun', 'profile delete', '-y', 'purge-identity',
                                         'install-watchdog.ps1', '-Remove'],
               'scripts/bridge-watchdog.ps1': ['watchdog.lock', 'Test-Bridge', 'WindowsApps'],
+              'install.sh': ['powershell.exe', 'cygpath', 'scripts/install.ps1'],
+              'doctor.sh': ['powershell.exe', 'scripts/doctor.ps1'],
           }
           bad = []
           for path, needles in need.items():

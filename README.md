@@ -84,9 +84,14 @@ cd "$env:USERPROFILE\hermes-excel"
 Если сертификата нет и Node не установлен, установщик выдаст его через `openssl` из git-bash и добавит
 в доверенные корни — **Node не обязателен**. Снять всё: `scripts\uninstall.ps1`.
 
+**В git-bash / MSYS запускайте `./install.sh` и `./doctor.sh`** — это те же скрипты, но без ловушки cmd:
+`cmd //c install.cmd` в MSYS калечится (`//c` съедается), и вместо установки открывается интерактивная
+консоль cmd, в которой агент висит. В cmd/PowerShell работают `install.cmd` / `doctor.cmd`.
+
 Агенту, которого вы отправите настраивать другую машину, достаточно сказать:
-«склонируй https://github.com/MaratAhmetzyanov83/hermes-excel и выполни install.cmd, затем doctor.cmd;
-инструкция — в AGENTS.md» — там же грабли и порядок проверки.
+«склонируй https://github.com/MaratAhmetzyanov83/hermes-excel и поставь надстройку: запусти установку
+(в PowerShell/cmd — `install.cmd`, в git-bash — `./install.sh`), затем проверку (`doctor.cmd` или
+`./doctor.sh`) — все строки должны стать PASS. Инструкция, порядок проверки и грабли — в AGENTS.md».
 
 ### Те же шаги вручную
 
