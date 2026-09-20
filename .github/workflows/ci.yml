@@ -111,6 +111,8 @@ jobs:
               'scripts/uninstall.ps1': ['DryRun', 'profile delete', '-y', 'purge-identity',
                                         'install-watchdog.ps1', '-Remove'],
               'scripts/bridge-watchdog.ps1': ['watchdog.lock', 'Test-Bridge', 'WindowsApps'],
+              'scripts/run-watchdog.vbs': ['wscript', 'bridge-watchdog.ps1'],
+              'scripts/install-watchdog.ps1': ['wscript', 'run-watchdog.vbs'],
               'install.sh': ['powershell.exe', 'cygpath', 'scripts/install.ps1'],
               'doctor.sh': ['powershell.exe', 'scripts/doctor.ps1'],
           }
@@ -152,7 +154,8 @@ jobs:
                               (r'creationflags', 'запуск процесса без shell'),
                               (r'PANE_SOURCE', 'метка источника сессии (иначе чаты невидимы)'),
                               (r'/upload', 'приём вложений из панели'),
-                              (r'clean_attachments', 'фильтр путей вложений')):
+                              (r'clean_attachments', 'фильтр путей вложений'),
+                              (r'CREATE_NO_WINDOW', 'прогон агента без окна консоли')):
              assert re.search(needle, src), why
 
           # shell=True (подстановка команд) недопустим ни в одном вызове — проверяем по AST,
@@ -166,4 +169,5 @@ jobs:
           print('защиты на месте:', sorted(required))
           print('shell=True в вызовах: нет')
           print('вложения: /upload, clean_attachments, метка источника — на месте')
+          print('окна консолей: CREATE_NO_WINDOW на прогоне агента')
           PY

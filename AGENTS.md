@@ -151,6 +151,7 @@ grep -a "taskpane.html" workspace/bridge.log
 | `scripts/install.ps1` / `install.cmd` | установка одной командой (идемпотентно), `-DryRun`, `-Profile`, `-NoBridge` |
 | `scripts/uninstall.ps1` | снятие всего, что поставил install (`-Profile` — удалить и бота, `-Purge` — и workspace, `-DryRun`) |
 | `scripts/bridge-watchdog.ps1` | сторож: поднимает мост, если тот не отвечает (раз в минуту + при входе в Windows) |
+| `scripts/run-watchdog.vbs` | запускает сторожа без окна консоли (`wscript.exe` вместо `powershell.exe`) |
 | `scripts/install-watchdog.ps1` | ставит/снимает сторожа, `-Status` |
 | `scripts/doctor.ps1` / `doctor.cmd` | проверка надстройки одной командой (11 пунктов), `-Json`, `-Fix` |
 | `scripts/test-bridge-security.py` | регрессии моста: обход каталога, инъекция, CSRF, вложения, адресный стоп (17 проверок) |
@@ -238,6 +239,15 @@ grep -a "taskpane.html" workspace/bridge.log
     принимаются только внутри этого каталога (`clean_attachments`), иначе запрос заставил бы агента
     открыть любой файл машины. Агент открывает вложения сам — картинки требуют набора `vision`
     (`HERMES_BRIDGE_TOOLSETS="file,vision"` по умолчанию), документы — `read_file`.
+21. **Каждое сообщение в панели открывало окно терминала.** Мост запускал `hermes chat` с флагами
+    `CREATE_NEW_PROCESS_GROUP` — а консольное приложение, запущенное из процесса БЕЗ консоли, получает
+    собственное НОВОЕ окно консоли (мост живёт скрытым, поэтому окно достаётся ребёнку). Нужен
+    `CREATE_NO_WINDOW` (`PANE_CREATIONFLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`): stdout/stderr
+    и так в pipe, так что потоку ничего не мешает, а окна нет. Второй источник — задача планировщика,
+    запускающая `powershell.exe` (консольное приложение) раз в минуту: её надо запускать через
+    `wscript.exe` + `.vbs` с `Run(cmd, 0, False)` — wscript живёт в GUI-подсистеме и консоли не создаёт.
+    Проверка «нет окон» без глаз: сэмплировать `Get-Process | Where MainWindowHandle -ne 0` в момент
+    прогона — до правки окно появлялось, после правки счётчик остаётся нулевым.
 
 ## Если `git push` не проходит (TLS/VPN)
 

@@ -31,11 +31,22 @@ if ($Remove) {
     exit 0
 }
 
-# 1. Ярлык в «Автозагрузке»: поднимает мост сразу при входе в Windows, окно не показывается
+# Запуск без окна: powershell.exe — консольное приложение, и при запуске раз в минуту из планировщика
+# или из «Автозагрузки» оно может мигнуть чёрным окном. wscript.exe живёт в GUI-подсистеме, консоли
+# не создаёт вовсе, а run-watchdog.vbs просит скрытое окно и для дочернего процесса.
+$vbs = Join-Path $PSScriptRoot 'run-watchdog.vbs'
+$useVbs = Test-Path $vbs
+
+# 1. Ярлык в «Автозагрузке»: поднимает мост сразу при входе в Windows
 $shell = New-Object -ComObject WScript.Shell
 $sc = $shell.CreateShortcut($lnk)
-$sc.TargetPath       = 'powershell.exe'
-$sc.Arguments        = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`" -Force"
+if ($useVbs) {
+    $sc.TargetPath = 'wscript.exe'
+    $sc.Arguments  = "`"$vbs`" -Force"
+} else {
+    $sc.TargetPath = 'powershell.exe'
+    $sc.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`" -Force"
+}
 $sc.WorkingDirectory = $root
 $sc.WindowStyle      = 7
 $sc.Description      = 'Hermes Excel Bridge: поднять мост при входе в Windows'
@@ -43,9 +54,13 @@ $sc.Save()
 Write-Host "ярлык автозапуска: $lnk"
 
 # 2. Задача планировщика: раз в минуту проверяет мост и поднимает его, если тот упал
-$action = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`""
+if ($useVbs) {
+    $action = "wscript.exe `"$vbs`""
+} else {
+    $action = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`""
+}
 schtasks /Create /TN $task /TR $action /SC MINUTE /MO 1 /F | Out-Null
-Write-Host "задача планировщика: $task (раз в минуту)"
+Write-Host "задача планировщика: $task (раз в минуту, без окна)"
 
 # 3. Сразу проверяем, что всё живо
 schtasks /Run /TN $task | Out-Null

@@ -77,6 +77,12 @@ PANE_SOURCE = os.environ.get("HERMES_BRIDGE_SOURCE", "excel")
 RUN_TIMEOUT = float(os.environ.get("HERMES_BRIDGE_TIMEOUT", "1800"))
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)
+# Консольное приложение, запущенное из процесса БЕЗ консоли, получает собственное новое окно консоли —
+# именно это «всплывало» у пользователя на каждое сообщение в панели. CREATE_NO_WINDOW создаёт процесс
+# без окна (stdout/stderr и так идут в pipe), CREATE_NEW_PROCESS_GROUP оставляем: по нему убиваем дерево.
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+PANE_CREATIONFLAGS = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 # Файлы запросов и рабочая папка прогонов — ВНЕ workspace: агент запускается с --in и видит файлы
 # вокруг себя, поэтому брошенные `.query-*.txt` прошлых ходов он принимал за текущую задачу
 # (наблюдалось: агент 60 с рассуждал о чужом промпте вместо своего).
@@ -622,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(PANE_DIR),
                     text=True, encoding="utf-8", errors="replace", bufsize=1,
                     env={**os.environ, "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1"},
-                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                    creationflags=PANE_CREATIONFLAGS,
                 )
             except FileNotFoundError:
                 sse("error", {"message": f"не найден исполняемый файл hermes ({HERMES})"})
