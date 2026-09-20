@@ -111,18 +111,8 @@ jobs:
 
       - name: Книга авто-открытия ссылается на тот же Id, что манифест
         run: |
-          python scripts/auto-open-workbook.py create
-          python - <<'PY'
-          import re, zipfile
-          mid = re.search(r'<Id>([0-9a-fA-F-]{36})</Id>',
-                          open('addin/manifest.xml', encoding='utf-8').read()).group(1)
-          z = zipfile.ZipFile('workspace/hermes-auto.xlsx')
-          ref = z.read('xl/webextensions/webextension1.xml').decode('utf-8')
-          assert mid.lower() in ref.lower(), (mid, ref[:200])
-          assert 'storeType="Registry"' in ref
-          print('id книги == id манифеста:', mid)
-          PY
-
+          python scripts/auto-open-workbook.py create   # путь по умолчанию: workspace/hermes-auto.xlsx
+          python scripts/check-workbook.py              # тот же чекер, что использует doctor.ps1
       - name: Регрессионные тесты моста (без запуска сервера — AST и правила)
         run: |
           python - <<'PY'

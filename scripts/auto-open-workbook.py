@@ -8,8 +8,11 @@
 и после этого кнопка надстройки появляется на ленте. Никаких ручных кликов.
 
 Использование:
-  python scripts/auto-open-workbook.py create <path.xlsx> [--addin-id ID]
+  python scripts/auto-open-workbook.py create [path.xlsx] [--addin-id ID]
   python scripts/auto-open-workbook.py tag    <existing.xlsx> [--addin-id ID]
+
+Путь можно не указывать: по умолчанию workspace/hermes-auto.xlsx (папка создаётся сама) —
+именно этот вызов делают install.ps1 и CI.
 """
 from __future__ import annotations
 
@@ -143,9 +146,12 @@ def write_workbook(path: Path, parts: dict[str, bytes]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=("create", "tag"))
-    ap.add_argument("path", type=Path)
+    # Путь необязателен: `create` без аргументов собирает рабочую книгу авто-открытия.
+    # Так его вызывают install.ps1, sideload.ps1 и CI — не заставляем помнить путь.
+    ap.add_argument("path", type=Path, nargs="?", default=ROOT / "workspace" / "hermes-auto.xlsx")
     ap.add_argument("--addin-id", default=None)
     a = ap.parse_args()
+    a.path.parent.mkdir(parents=True, exist_ok=True)
 
     addin_id = a.addin_id
     if not addin_id:
