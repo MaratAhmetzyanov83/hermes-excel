@@ -1,12 +1,11 @@
 ﻿# Сторож моста «Hermes для Excel»: если мост не отвечает — поднимает его.
 #
 # Зачем: мост — обычный локальный процесс, он не должен переживать перезагрузку «на честном слове».
-# Сторож проверяет /health и запускает мост заново, если тот упал. Вызывается:
-#   * планировщиком задач раз в минуту (scripts\install-watchdog.ps1),
-#   * ярлыком из «Автозагрузки» (тогда с ключом -Force, чтобы мост поднялся сразу при входе).
+# Сторож проверяет /health и запускает мост заново, если тот упал. Он вызывается
+# планировщиком задач раз в минуту и работает только пока запущен Excel.
 #
-# Запускать можно сколько угодно раз: второй мост не поднимется (bridge.py не переиспользует адрес
-# и падает с внятной ошибкой), а сам сторож защищён мьютексом. Всё пишется в workspace\watchdog.log.
+# Когда Excel закрыт, сторож останавливает мост. Это важно: процесс моста использует venv Hermes
+# и иначе блокирует обновление Hermes на Windows. Всё пишется в workspace\watchdog.log.
 
 param(
     [switch]$Force,          # поднимать мост, даже если Excel сейчас не запущен
@@ -73,13 +72,20 @@ if (Test-Path $lock) {
 Set-Content -Path $lock -Value (Get-Date -Format 's') -Encoding UTF8
 
 try {
-    if (Test-Bridge) { exit 0 }                # мост жив — ничего не делаем
-
     $excel = Get-Process EXCEL -ErrorAction SilentlyContinue
     if (-not $excel -and -not $Force) {
-        Write-Log 'мост не отвечает, но Excel не запущен — не поднимаю (запущу, когда откроется Excel)'
+        $holder = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+        if ($holder) {
+            $pids = $holder | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique
+            Write-Log ("Excel не запущен — останавливаю мост (PID $($pids -join ', '))")
+            foreach ($p in $pids) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }
+        } else {
+            Write-Log 'Excel не запущен — мост не поднимаю'
+        }
         exit 0
     }
+
+    if (Test-Bridge) { exit 0 }                # мост жив — ничего не делаем
 
     # Порт занят, но /health молчит — это зависший старый мост, его надо снять
     $holder = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue

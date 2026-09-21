@@ -1,5 +1,5 @@
-﻿# Ставит сторожа моста «Hermes для Excel»: задача планировщика (раз в минуту) + ярлык в «Автозагрузке».
-# После этого надстройка работает сама: открыли Excel — мост уже поднят, панель подключается к нему.
+﻿# Ставит сторожа моста «Hermes для Excel»: только задачу планировщика (раз в минуту).
+# Мост поднимается только пока запущен Excel и останавливается после его закрытия.
 #
 # Запуск:  powershell -ExecutionPolicy Bypass -File scripts\install-watchdog.ps1
 # Снять:   powershell -ExecutionPolicy Bypass -File scripts\install-watchdog.ps1 -Remove
@@ -19,7 +19,7 @@ $lnk     = Join-Path $startup 'Hermes Excel Bridge.lnk'
 
 if ($Status) {
     Write-Host "задача:  " -NoNewline; schtasks /Query /TN $task /FO LIST 2>$null | Select-String 'Status|Last Run|Next Run|Состояние|Последнее|Следующее'
-    Write-Host "ярлык:   " -NoNewline; if (Test-Path $lnk) { Write-Host $lnk } else { Write-Host 'нет' }
+    Write-Host "автозапуск при входе: отключен" -NoNewline; if (Test-Path $lnk) { Remove-Item $lnk -Force -ErrorAction SilentlyContinue; Write-Host ' (старый ярлык удалён)' } else { Write-Host '' }
     Write-Host "журнал:  " -NoNewline; Write-Host (Join-Path $root 'workspace\watchdog.log')
     exit 0
 }
@@ -37,23 +37,10 @@ if ($Remove) {
 $vbs = Join-Path $PSScriptRoot 'run-watchdog.vbs'
 $useVbs = Test-Path $vbs
 
-# 1. Ярлык в «Автозагрузке»: поднимает мост сразу при входе в Windows
-$shell = New-Object -ComObject WScript.Shell
-$sc = $shell.CreateShortcut($lnk)
-if ($useVbs) {
-    $sc.TargetPath = 'wscript.exe'
-    $sc.Arguments  = "`"$vbs`" -Force"
-} else {
-    $sc.TargetPath = 'powershell.exe'
-    $sc.Arguments  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`" -Force"
-}
-$sc.WorkingDirectory = $root
-$sc.WindowStyle      = 7
-$sc.Description      = 'Hermes Excel Bridge: поднять мост при входе в Windows'
-$sc.Save()
-Write-Host "ярлык автозапуска: $lnk"
+# 1. Удаляем старый ярлык: он запускал мост независимо от Excel и блокировал обновления Hermes.
+Remove-Item $lnk -Force -ErrorAction SilentlyContinue
 
-# 2. Задача планировщика: раз в минуту проверяет мост и поднимает его, если тот упал
+# 2. Задача планировщика: раз в минуту проверяет мост и поднимает его только при работающем Excel
 if ($useVbs) {
     $action = "wscript.exe `"$vbs`""
 } else {
@@ -73,5 +60,5 @@ try {
 }
 
 Write-Host ''
-Write-Host 'Готово. Откройте Excel (или workbook workspace\hermes-auto.xlsx) — панель Hermes подключится сама.'
-Write-Host 'Снять автозапуск: powershell -ExecutionPolicy Bypass -File scripts\install-watchdog.ps1 -Remove'
+Write-Host 'Готово. Мост работает только пока запущен Excel; после закрытия Excel он будет остановлен.'
+Write-Host 'Снять сторож: powershell -ExecutionPolicy Bypass -File scripts\install-watchdog.ps1 -Remove'

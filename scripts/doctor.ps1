@@ -58,7 +58,7 @@ Add-Row "бот-профиль '$profileName'" ($(if ($botOk) { 'PASS' } else { 
     $(if ($botOk) { $botHome } else { 'нет state.db у профиля' }) `
     "hermes profile create $profileName --clone"
 
-# 4. сторож: задача планировщика + ярлык автозагрузки
+# 4. сторож: задача планировщика (автозапуск при входе намеренно отключён)
 $task = Get-ScheduledTask -TaskName 'Hermes Excel Bridge Watchdog' -ErrorAction SilentlyContinue
 if ($task) {
     $info = $task | Get-ScheduledTaskInfo
@@ -71,9 +71,9 @@ if ($task) {
         'powershell -File scripts\install-watchdog.ps1'
 }
 $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Hermes Excel Bridge.lnk'
-Add-Row 'сторож: автозапуск при входе' ($(if (Test-Path $lnk) { 'PASS' } else { 'WARN' })) `
-    $(if (Test-Path $lnk) { 'ярлык на месте' } else { 'ярлыка нет' }) `
-    'powershell -File scripts\install-watchdog.ps1'
+Add-Row 'сторож: автозапуск при входе' ($(if (-not (Test-Path $lnk)) { 'PASS' } else { 'WARN' })) `
+    $(if (-not (Test-Path $lnk)) { 'отключен — мост ждёт Excel' } else { 'старый ярлык запускает мост независимо от Excel' }) `
+    'powershell -ExecutionPolicy Bypass -File scripts\install-watchdog.ps1'
 
 # 5. сайлоад: запись в реестре указывает на существующий манифест с тем же Id
 $manifest = Join-Path $root 'addin\manifest.xml'
