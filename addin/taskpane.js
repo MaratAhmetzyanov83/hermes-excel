@@ -226,10 +226,14 @@ async function readSelection() {
       note = `взяты первые ${rows} строк и ${cols} колонок выделения`;
       target = sel.getCell(0, 0).getResizedRange(rows - 1, cols - 1);
     }
-    target.load("address,text,values");
+    target.load("address,text,values,formulas");
     await ctx.sync();
 
     const grid = target.values || [];
+    // Формулы: без них агент не может ни диагностировать «#ССЫЛКА!», ни починить ячейку —
+    // он видел только вычисленные значения. Шлём отдельным блоком, только если формулы есть.
+    const frms = target.formulas || [];
+    const hasFormulas = frms.some((r) => (r || []).some((c) => typeof c === "string" && c.trim().startsWith("=")));
     const blank = !grid.some((r) => (r || []).some((c) => c !== "" && c !== null));
     // Якорь = первая ячейка ИСХОДНОГО выделения. Берём из уже загруженной строки адреса
     // ("Лист1!I10:L18" → "Лист1!I10"): у свежесозданного getCell(0,0) свойство address ещё не загружено.
@@ -237,12 +241,13 @@ async function readSelection() {
 
     state.ctx = {
       csv: blank ? "" : toCsv(target.text && target.text.length ? target.text : grid),
+      formulas: hasFormulas ? toCsv(frms) : "",
       meta: { sheet: sheet.name, range: target.address, shape: [grid.length, (grid[0] || []).length], note },
       empty: blank, anchor,
     };
     if (!state.ctxDirty) $("ctxCsv").value = state.ctx.csv;   // ручные правки не затираем
     $("ctxLabel").textContent = `${state.ctx.meta.sheet}!${target.address.replace(/^.*!/, "")}`
-      + (blank ? " · пусто" : "") + (note ? " · " + note : "");
+      + (blank ? " · пусто" : "") + (state.ctx.formulas ? " · формулы" : "") + (note ? " · " + note : "");
     const saved = localStorage.getItem(storageKey());
     if (saved && !state.sessionId) { setSession(saved); loadHistory(); }
     if (!$("chat").querySelector(".msg")) emptyState();
@@ -351,10 +356,12 @@ function writeCsv(csv, opts) {
 }
 
 function writeFormulas(block, opts) {
-  const lines = (block || "").split("\n").map((s) => s.trim()).filter(Boolean)
-    .map((s) => [s.replace(/^`|`$/g, "")]);
+  // Одна формула в строке → колонка. Несколько колонок — формулы через ТАБ (запятая внутри
+  // формулы занята аргументами, поэтому разделитель именно таб).
+  const lines = (block || "").split("\n").map((s) => s.trim()).filter(Boolean);
   if (!lines.length) return false;
-  writeGrid(lines, true, opts);
+  const grid = lines.map((s) => s.replace(/^`|`$/g, "").split("\t").map((c) => c.trim()));
+  writeGrid(grid, true, opts);
   return true;
 }
 
@@ -548,7 +555,8 @@ async function send() {
     reasoning: $("reasonSel").value,
     file_name: state.workbook, sheet: state.ctx.meta.sheet || "", range: state.ctx.meta.range || "",
     shape: state.ctx.meta.shape || null,
-    context: { csv: useCsv, note: state.ctx.meta.note || "", empty: !useCsv },
+    context: { csv: useCsv, formulas: (state.useCtx && !state.ctxDirty) ? (state.ctx.formulas || "") : "",
+               note: state.ctx.meta.note || "", empty: !useCsv },
     attachments: ready.map((a) => ({ path: a.path, name: a.name, kind: a.kind })),
   };
 
@@ -564,6 +572,7 @@ async function send() {
   const t0 = Date.now();
   state.controller = new AbortController();
   let acc = "";
+  let logText = "";
   let bubble = null;
   try {
     const res = await fetch(BASE + "/chat", {
@@ -603,6 +612,7 @@ async function send() {
           bubble.classList.remove("working");
           renderDelta(bubble, acc);
         } else if (kind === "tool" || kind === "log") {
+          logText += (data.text || data.name || "") + "\n";
           // Инструменты пишем всегда, а не только после первого текста: именно они показывают,
           // что агент жив, когда модель «думает» десятки секунд.
           if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); startStatus(bubble, t0); }
@@ -620,6 +630,12 @@ async function send() {
           setSession(data.session_id || state.sessionId);
         } else if (kind === "error") {
           hideTyping(); stopStatus();
+          // id чата мог остаться от другого профиля моста: сбрасываем, иначе каждая попытка
+          // упирается в тот же exit 1
+          if (/No session found|не найдена в /i.test(logText)) {
+            setSession("");
+            loadSessions();
+          }
           const b = addMessage("assistant", data.message || "ошибка моста");
           b.classList.add("failed");
           if (data.hint) {
@@ -748,6 +764,37 @@ function wire() {
     toast(state.useCtx ? "Контекст выделения включён" : "Контекст выделения выключен");
   };
   $("modelSel").onchange = () => localStorage.setItem("hermes.model", $("modelSel").value);
+  // Усилие (reasoning) — на каждую реплику, поэтому выбор стоит в футере и запоминается.
+  const reasonSel = $("reasonSel");
+  const savedReason = localStorage.getItem("hermes.reasoning");
+  if (savedReason && [...reasonSel.options].some((o) => o.value === savedReason)) reasonSel.value = savedReason;
+  reasonSel.onchange = () => {
+    localStorage.setItem("hermes.reasoning", reasonSel.value);
+    toast(reasonSel.value === "auto" ? "усилие: как в Hermes" : "усилие: " + reasonSel.value);
+  };
+  // ⟳: живой перезапрос каталогов моделей. Панель берёт список из кэша профиля бота (TTL 1 час),
+  // поэтому после смены ключа/тарифа без этой кнопки новые модели не появлялись до истечения часа.
+  $("btnRefreshModels").onclick = async () => {
+    const btn = $("btnRefreshModels");
+    btn.disabled = true; btn.textContent = "…";
+    try {
+      const r = await fetch(BASE + "/models?refresh=1", { cache: "no-store" });
+      const d = await r.json();
+      const provs = d.providers || [];
+      const selP = $("providerSel"), keep = selP.value;
+      selP.innerHTML = '<option value="auto">как в Hermes</option>';
+      provs.forEach((p) => selP.add(new Option(p.provider, p.provider)));
+      if ([...selP.options].some((o) => o.value === keep)) selP.value = keep;
+      refreshModels(provs, $("modelSel").value || "");
+      const rf = d.refresh || {};
+      if (rf.ok === false) toast("модели не обновились: " + (rf.error || "ошибка"), true);
+      else toast(`модели обновлены · провайдеров ${provs.length}`);
+    } catch (e) {
+      toast("не удалось обновить модели: " + (e.message || e), true);
+    } finally {
+      btn.disabled = false; btn.textContent = "⟳";
+    }
+  };
   $("providerSel").onchange = () => {
     localStorage.setItem("hermes.provider", $("providerSel").value);
     fetch(BASE + "/models").then((r) => r.json()).then((d) => refreshModels(d.providers, "")).catch(() => {});

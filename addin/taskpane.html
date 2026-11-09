@@ -20,10 +20,6 @@
 
   <section id="settings" class="settings hidden">
     <label>Провайдер<select id="providerSel"></select></label>
-    <label>Усилие<select id="reasonSel">
-      <option value="auto">auto</option><option value="low">low</option>
-      <option value="medium">medium</option><option value="high">high</option>
-    </select></label>
     <label class="switch"><input type="checkbox" id="autoWrite" checked/> писать результат в лист сразу</label>
     <label class="switch"><input type="checkbox" id="useCtx" checked/> брать выделение как контекст</label>
     <label class="stacked">Другие чаты бота<select id="sessionPick"></select></label>
@@ -66,7 +62,21 @@
         <select id="modelSel" title="Модель"></select>
         <svg viewBox="0 0 16 16" class="chev" aria-hidden="true"><path d="M4 6.5 8 10.5 12 6.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </div>
-      <button id="btnOpen" class="link">открыть в Hermes</button>
+      <div class="model-pick effort-pick">
+        <select id="reasonSel" title="Уровень усилий (reasoning): auto — как в Hermes; уровни как у /reasoning">
+        <option value="auto">auto</option>
+        <option value="minimal">minimal</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
+        <option value="ultra">ultra</option>
+        </select>
+        <svg viewBox="0 0 16 16" class="chev" aria-hidden="true"><path d="M4 6.5 8 10.5 12 6.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <button id="btnRefreshModels" class="link" title="Обновить список моделей у провайдеров">⟳</button>
+      <button id="btnOpen" class="link" title="открыть этот чат в приложении Hermes">в Hermes</button>
       <span id="sessionInfo" class="muted">подключение…</span>
     </div>
   </footer>

@@ -50,13 +50,55 @@ HERMES = os.environ.get("HERMES_BIN") or shutil.which("hermes") or "hermes"
 
 # Бот для Excel = отдельный профиль Hermes: свой конфиг, память, скиллы и СВОИ сессии.
 # Пустой PROFILE или "default" — работаем в основном профиле.
-PROFILE = (os.environ.get("HERMES_BRIDGE_PROFILE") or "excel").strip()
+# Сейчас по умолчанию основной профиль (панель видит всю память и скиллы Hermes); вернуть
+# отдельного бота: HERMES_BRIDGE_PROFILE=excel в окружении моста (или положить "excel" здесь).
+PROFILE = (os.environ.get("HERMES_BRIDGE_PROFILE") or "default").strip()
 _HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 HERMES_HOME = _HOME if PROFILE in ("", "default") else (_HOME / "profiles" / PROFILE)
 STATE_DB = HERMES_HOME / "state.db"
 MODELS_CACHE = HERMES_HOME / "provider_models_cache.json"
 # у свежего бота кэша моделей может не быть — берём его из основного профиля (только чтение)
 FALLBACK_MODELS_CACHE = _HOME / "provider_models_cache.json"
+# Обновление списка моделей по кнопке ⟳ в панели (GET /models?refresh=1). Кэш моделей живёт в
+# профиле бота с TTL 1 час, но после смены ключа/тарифа список в панели надо перечитать живьём:
+# скрипт дёргает каждый провайдер через /v1/models и перезаписывает кэш.
+REFRESH_MODELS_PY = ROOT / "scripts" / "refresh-models.py"
+
+
+def _refresh_models() -> dict:
+    """Живой опрос провайдеров в отдельном процессе (нужен движок Hermes, а не stdlib моста)."""
+    if not REFRESH_MODELS_PY.exists():
+        return {"ok": False, "error": f"нет скрипта {REFRESH_MODELS_PY}"}
+    engine = os.environ.get("HERMES_ENGINE") or str(_HOME / "hermes-agent")
+    pythons = [
+        os.environ.get("HERMES_ENGINE_PY"),
+        str(_HOME / "hermes-agent" / "venv" / "Scripts" / "python.exe"),
+        str(Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent" / "venv" / "Scripts" / "python.exe"),
+        str(ROOT / ".venv" / "Scripts" / "python.exe"),
+    ]
+    last = ""
+    for py in [p for p in pythons if p]:
+        if not Path(py).exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [py, str(REFRESH_MODELS_PY), "--home", str(HERMES_HOME)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                env={**os.environ, "HERMES_ENGINE": engine, "PYTHONIOENCODING": "utf-8"},
+                stdin=subprocess.DEVNULL, creationflags=PANE_CREATIONFLAGS,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            continue
+        if proc.returncode == 0:
+            try:
+                return {"ok": True, **json.loads(proc.stdout.strip().splitlines()[-1])}
+            except (ValueError, IndexError):
+                last = "скрипт не вернул JSON"
+                continue
+        last = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [f"exit {proc.returncode}"]
+        last = last[0] if isinstance(last, list) else last
+    return {"ok": False, "error": last or "не нашёл интерпретатор движка Hermes"}
 
 MAX_CONTEXT_ROWS = 400          # сколько строк выделения уходит модели
 MAX_CONTEXT_COLS = 60
@@ -68,12 +110,19 @@ SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
 PANE_TOOLSETS = os.environ.get("HERMES_BRIDGE_TOOLSETS", "file,vision")
 PANE_SKILLS = [s for s in os.environ.get("HERMES_BRIDGE_SKILLS", "excel-pane-contract").split(",") if s]
 # Бюджет прогона: на 80 % модель получает предупреждение и успевает свернуть работу.
-RUN_BUDGET = float(os.environ.get("HERMES_BRIDGE_RUN_BUDGET", "240"))
+# Гейтвейный `hermes chat` (Hermes с общим гейтвеем профиля) отвергает CLI-флаг
+# `--run-budget`: «Unsupported gateway CLI options … use agent.run_budget_seconds in config.yaml»,
+# прогон падает с exit 2 ещё до обращения к модели. Флаг по умолчанию не передаём — бюджет
+# живёт в конфиге профиля:  hermes -p excel config set agent.run_budget_seconds 240
+RUN_BUDGET = float(os.environ.get("HERMES_BRIDGE_RUN_BUDGET", "0"))
 # Метка источника сессии. КРИТИЧНО: без неё одноразовый прогон (`-Q --query-file`) помечается
 # Hermes как source='oneshot', а oneshot входит в INTERNAL_LISTING_SOURCES — такие сессии
 # исключены из ВСЕХ человеческих списков (десктоп, TUI, `hermes sessions list`), и чаты,
 # начатые в Excel, просто не видны в Hermes. Отсюда же снят `--source excel`.
-PANE_SOURCE = os.environ.get("HERMES_BRIDGE_SOURCE", "excel")
+# Hermes с гейтвеем знает только фиксированный набор источников (cli, tui, gui, acp, tool,
+# oneshot) и на `--source excel` отвечает «Gateway does not support source 'excel'» — прогон
+# не стартует. Берём 'cli': такие сессии видны в списках Hermes и открываются в десктопе.
+PANE_SOURCE = os.environ.get("HERMES_BRIDGE_SOURCE", "cli")
 RUN_TIMEOUT = float(os.environ.get("HERMES_BRIDGE_TIMEOUT", "1800"))
 
 WORKSPACE.mkdir(parents=True, exist_ok=True)
@@ -156,7 +205,7 @@ def hermes_default() -> dict[str, str]:
 def model_catalog() -> dict:
     """Провайдеры и модели из кэша моделей бота (+ запасной кэш основного профиля)."""
     providers: list[dict] = []
-    seen: set[str] = set()
+    index: dict[str, dict] = {}
     for cache in (MODELS_CACHE, FALLBACK_MODELS_CACHE):
         try:
             raw = json.loads(cache.read_text(encoding="utf-8"))
@@ -169,12 +218,38 @@ def model_catalog() -> dict:
             clean = name.split("#")[0]
             if clean.startswith("custom:"):
                 clean = "custom"
-            if clean in seen:
+            known = index.get(clean)
+            if known is not None:
+                # НЕ «первый победил»: у профиля бота свой набор креденшелов, и его короткий
+                # каталог (например openai-codex: 6 против 15) раньше прятал модели основного
+                # профиля — в панели их просто не было в списке.
+                have = set(known["models"])
+                known["models"].extend(m for m in models if m not in have)
                 continue
-            seen.add(clean)
-            providers.append({"provider": clean, "models": list(models)})
+            row = {"provider": clean, "models": list(models)}
+            index[clean] = row
+            providers.append(row)
     providers.sort(key=lambda p: p["provider"])
     return {"default": hermes_default(), "profile": PROFILE, "providers": providers}
+
+
+def session_exists(session_id: str) -> bool:
+    """Есть ли такой чат в state.db профиля, которым сейчас работает мост.
+
+    Панель помнит id сессии в localStorage, а профиль бота можно переключить (`excel` → `default`):
+    старый id живёт в ДРУГОЙ базе, `hermes chat --resume <id>` падает с exit 1 («No session found»),
+    и пользователь видит только «прогон завершился с кодом 1». Поэтому id проверяем заранее.
+    """
+    if not SESSION_ID_RE.fullmatch(session_id or "") or not STATE_DB.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            return con.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is not None
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
 
 
 def session_messages(session_id: str, limit: int = 12) -> list[dict]:
@@ -325,6 +400,22 @@ def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
         note = context.get("note")
         if note:
             parts.append(f"({note})")
+        formulas = str(context.get("formulas") or "").strip()
+        if formulas:
+            # Без этого блока агент видел только вычисленные значения и на «починить формулу»
+            # мог ответить одними словами — писать в лист было нечего.
+            parts.append(
+                "[Формулы выделения] Те же ячейки, что в CSV, но содержимое формул (порядок строк и "
+                "колонок совпадает; ячейка без «=» — обычное значение, пустая — пусто):"
+            )
+            parts.append(formulas)
+            parts.append(
+                "Если просят поправить, пересчитать или заменить формулы — не ограничивайся объяснением: "
+                "верни блок ```formulas с НОВЫМ содержимым этих ячеек (по одной формуле в строке; если "
+                "колонок несколько — формулы в строке через табуляцию), сохраняя рабочие части исходных "
+                "формул и абсолютные ссылки. Блок заменяет диапазон от якорной ячейки, поэтому выше "
+                "одной строкой напиши, что меняешь."
+            )
         parts.append(
             "Если результат нужно положить в книгу — верни его отдельным блоком ```csv (с шапкой, "
             "столбцы через запятую) либо блоком ```formulas с формулами Excel по одной в строке. "
@@ -453,7 +544,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/models":
-            self._json(model_catalog())
+            catalog = model_catalog()
+            if "refresh=1" in self.path:
+                # ⟳ в панели: список моделей перечитывается живьём (может занять до минуты)
+                catalog["refresh"] = _refresh_models()
+                catalog = {**model_catalog(), "refresh": catalog["refresh"]}
+            self._json(catalog)
             return
         if path == "/sessions":
             q = self.path.split("limit=")[-1] if "limit=" in self.path else "40"
@@ -560,6 +656,11 @@ class Handler(BaseHTTPRequestHandler):
         shape_raw = body.get("shape")
         shape = shape_raw if isinstance(shape_raw, list) and len(shape_raw) == 2 else None
         session_id = str(body.get("session_id") or "").strip()
+        if session_id and session_id != "new" and not session_exists(session_id):
+            # Панель помнит id из localStorage; после смены профиля моста его нет в этой базе.
+            # Раньше это давало exit 1 в каждой попытке — начинаем новый чат вместо ошибки.
+            log(f"chat: сессия {session_id[:22]}… не найдена в {STATE_DB.name} профиля {PROFILE!r} — новый чат")
+            session_id = ""
         model = str(body.get("model") or "").strip()
         provider = str(body.get("provider") or "").strip()
         reasoning = str(body.get("reasoning") or "").strip()

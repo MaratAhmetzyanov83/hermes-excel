@@ -47,6 +47,21 @@ COLLECT = """
       const w = window.__writes || [];
       OUT.ctxLabel = (document.getElementById("ctxLabel") || {}).textContent || "";
       OUT.selection = (document.getElementById("ctxCsv") || {}).value ? "прочитано" : "пусто";
+      OUT.reasonSel = (() => {
+        const r = document.getElementById("reasonSel");
+        if (!r) return null;
+        const cs = getComputedStyle(r);
+        const box = r.getBoundingClientRect();
+        return {w: Math.round(box.width), x: Math.round(box.x), min: cs.minWidth, max: cs.maxWidth,
+                cls: r.className, value: r.value, options: [...r.options].map((o) => o.value).join(","),
+                selectedText: (r.selectedOptions[0] || {}).textContent,
+                font: cs.fontSize + " / " + cs.fontFamily, color: cs.color,
+                visible: box.width > 0 && cs.display !== "none" && cs.visibility !== "hidden"};
+      })();
+      OUT.footer = [...document.querySelectorAll(".footer-row > *, .footer-row .model-pick")]
+        .map((el) => ({tag: el.tagName, id: el.id || el.className, x: Math.round(el.getBoundingClientRect().x),
+                       w: Math.round(el.getBoundingClientRect().width),
+                       text: String(el.value ?? el.textContent ?? "").slice(0, 18)}));
       OUT.csvHead = ((document.getElementById("ctxCsv") || {}).value || "").slice(0, 34);
       OUT.ctxLines = ((document.getElementById("ctxCsv") || {}).value || "").split("\\n").length;
       OUT.suggestions = [...document.querySelectorAll(".sug b")].map((b) => b.textContent);
