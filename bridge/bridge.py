@@ -107,7 +107,9 @@ SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
 # Панель отвечает текстом и блоками ```csv/```formulas: браузер, картинки, cron и делегирование
 # ей не нужны. Узкий набор вдвое уменьшает промпт (схемы инструментов) и убирает круги
 # «попробовал инструмент — политика запретила». Расширяется через HERMES_BRIDGE_TOOLSETS.
-PANE_TOOLSETS = os.environ.get("HERMES_BRIDGE_TOOLSETS", "file,vision")
+# excel — инструменты плагина excel-bridge: агент читает и правит ОТКРЫТУЮ книгу напрямую (COM),
+# а панель после хода показывает журнал правок со ссылками и откатом.
+PANE_TOOLSETS = os.environ.get("HERMES_BRIDGE_TOOLSETS", "file,vision,excel")
 PANE_SKILLS = [s for s in os.environ.get("HERMES_BRIDGE_SKILLS", "excel-pane-contract").split(",") if s]
 # Бюджет прогона: на 80 % модель получает предупреждение и успевает свернуть работу.
 # Гейтвейный `hermes chat` (Hermes с общим гейтвеем профиля) отвергает CLI-флаг
@@ -385,12 +387,57 @@ def clean_attachments(raw: object) -> list[dict]:
     return out
 
 
+MUTATING_TOOLS = {"excel_write", "excel_format", "excel_sheets", "excel_calc"}
+
+
+def read_changes(since: float, session_ids: set[str], workbook: str) -> list[dict]:
+    """Правки открытой книги, сделанные агентом за этот ход (журнал плагина excel-bridge)."""
+    path = HERMES_HOME / "plugin-data" / "excel-bridge" / "journal.jsonl"
+    try:
+        if not path.is_file() or path.stat().st_mtime < since - 1:
+            return []
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-3000:]
+    except OSError:
+        return []
+    out: list[dict] = []
+    budget = 3_000_000
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if float(e.get("ts") or 0) < since:
+            continue
+        sid = str(e.get("session_id") or "")
+        if sid and session_ids and sid not in session_ids:
+            continue
+        # Правки в ДРУГОЙ книге не прячем: пользователь должен видеть, что агент тронул не только
+        # эту книгу. Откатить их панель не может (Office.js видит лишь свою книгу) — помечаем.
+        if workbook and e.get("workbook") and str(e["workbook"]).lower() != workbook.lower():
+            e["other_workbook"] = True
+        size = len(line)
+        if size > budget:
+            e.pop("before", None)
+            e["too_big"] = True
+        budget -= min(size, budget)
+        out.append(e)
+    return out
+
+
 def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
                 rng: str, shape: tuple[int, int] | None,
                 attachments: list[dict] | None = None) -> str:
     """Собирает итоговый промпт: сначала контекст листа, затем задачу пользователя."""
     parts: list[str] = []
     empty = bool(context and context.get("empty"))
+    if file_name:
+        parts.append(
+            f"[Книга Excel] Открыта книга «{file_name}», активный лист «{sheet or '—'}», выделение "
+            f"{rng or '—'}. Инструменты excel_* работают с ней напрямую: передавай workbook=\"{file_name}\". "
+            "Нужные данные читай сам (excel_info / excel_read), изменения вноси сам (excel_write / "
+            "excel_format / excel_sheets) — пользователь увидит их сразу и сможет откатить. "
+            "В ответе ссылайся на ячейки как [[Лист!A1:B5]]."
+        )
     if context and context.get("csv"):
         rows, cols = shape if shape else (0, 0)
         head = (f"[Контекст Excel] Файл: {file_name or 'неизвестно'} | Лист: {sheet or '—'} | "
@@ -411,15 +458,14 @@ def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
             parts.append(formulas)
             parts.append(
                 "Если просят поправить, пересчитать или заменить формулы — не ограничивайся объяснением: "
-                "верни блок ```formulas с НОВЫМ содержимым этих ячеек (по одной формуле в строке; если "
-                "колонок несколько — формулы в строке через табуляцию), сохраняя рабочие части исходных "
-                "формул и абсолютные ссылки. Блок заменяет диапазон от якорной ячейки, поэтому выше "
-                "одной строкой напиши, что меняешь."
+                "запиши исправленные формулы в эти ячейки инструментом excel_write, сохраняя рабочие "
+                "части исходных формул и абсолютные ссылки, затем проверь результат excel_read "
+                "(what=both)."
             )
         parts.append(
-            "Если результат нужно положить в книгу — верни его отдельным блоком ```csv (с шапкой, "
-            "столбцы через запятую) либо блоком ```formulas с формулами Excel по одной в строке. "
-            "Перед блоками кратко поясни вывод. Формулы пиши на английском (SUM, SUMIFS, XLOOKUP)."
+            "Выше — только выделение; остальная книга доступна через excel_read. Если результат "
+            "нужно положить в книгу — запиши его инструментом excel_write (формулы на английском: "
+            "SUM, SUMIFS, XLOOKUP). Блоки ```csv / ```formulas — только если инструменты недоступны."
         )
         parts.append("Файл открыт в Excel прямо сейчас, данные выше — это и есть его содержимое: "
                      "искать книгу на диске и проверять файлы не нужно.")
@@ -431,9 +477,9 @@ def build_query(prompt: str, context: dict | None, file_name: str, sheet: str,
         parts.append(
             "Пользователь просит подготовить содержимое, чтобы записать его в этот диапазон (или рядом с ним). "
             "Не задавай уточняющих вопросов, если можно сделать разумное предположение — сделай работу. "
-            "Ответь одним коротким предложением, что именно подготовил, и обязательно верни готовый результат "
-            "ОТДЕЛЬНЫМ блоком ```csv (первая строка — шапка, разделитель — запятая) либо блоком ```formulas "
-            "с формулами по одной в строке. Никакого текста после блока."
+            "Подготовь результат и запиши его в книгу инструментом excel_write начиная с этого диапазона "
+            "(если инструменты недоступны — верни блок ```csv или ```formulas). Ответь одним-двумя "
+            "предложениями, что сделал, со ссылкой на ячейки."
         )
     if attachments:
         # Файлы, брошенные в панель: отдаём абсолютные пути и сразу говорим, что с ними делать —
@@ -723,6 +769,8 @@ class Handler(BaseHTTPRequestHandler):
         proc = None
         sid = session_id
         watchdog = None
+        t_seen = time.time() - 0.5    # с какого момента журнал правок ещё не показан панели
+        file_name = str(body.get("file_name") or "")
         try:
             try:
                 proc = subprocess.Popen(
@@ -776,7 +824,20 @@ class Handler(BaseHTTPRequestHandler):
                     sse("delta", {"text": evt.get("text", "")})
                 elif kind == "tool" or kind == "tool_use" or kind == "tool_call":
                     sse("tool", {"name": evt.get("name") or evt.get("tool") or "tool",
-                                 "detail": evt.get("detail") or evt.get("input") or ""})
+                                 "detail": evt.get("detail") or evt.get("input") or "",
+                                 "id": evt.get("tool_call_id") or ""})
+                elif kind == "tool_result":
+                    name = str(evt.get("name") or "")
+                    sse("tool_done", {"name": name, "id": evt.get("tool_call_id") or "",
+                                      "ms": evt.get("duration_ms") or 0,
+                                      "error": bool(evt.get("is_error")) or '"ok": false' in str(evt.get("output") or "")})
+                    if name in MUTATING_TOOLS:
+                        # Правки показываем по ходу работы, а не только в конце: так видно, что и где
+                        # агент уже поменял, пока он продолжает.
+                        fresh = read_changes(t_seen, {x for x in (sid, session_id) if x}, file_name)
+                        if fresh:
+                            t_seen = max(float(e.get("ts") or 0) for e in fresh) + 1e-6
+                            sse("changes", {"items": fresh})
                 elif kind == "result":
                     sid = str(evt.get("session_id") or sid)
                     code = int(evt.get("exit_code") or 0)
@@ -801,6 +862,9 @@ class Handler(BaseHTTPRequestHandler):
             if sid:
                 flag = f"-p {PROFILE} " if PROFILE and PROFILE != "default" else ""
                 hint = f"hermes {flag}chat --resume {sid}"
+            changes = read_changes(t_seen, {x for x in (sid, session_id) if x}, file_name)
+            if changes:
+                sse("changes", {"items": changes})
             sse("done", {"session_id": sid, "exit_code": code, "resume_hint": hint})
         except (BrokenPipeError, ConnectionResetError):
             if proc and proc.poll() is None:

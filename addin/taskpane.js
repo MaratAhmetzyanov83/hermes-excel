@@ -70,6 +70,226 @@ function stripBlocks(md) {
   return md.replace(/```[a-z]*\s*\n[\s\S]*?```/gi, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/* ------------------------------------------------------------------ ссылки на ячейки
+   Агент пишет [[Лист!A1:B5]] — в ответе это кнопка, которая выделяет диапазон в книге. */
+
+const REF_RE = /\[\[([^\]\n]{1,160})\]\]/g;
+
+function splitRef(ref) {
+  const r = String(ref || "").trim();
+  const i = r.lastIndexOf("!");
+  if (i < 0) return { sheet: "", addr: r.replace(/\$/g, "") };
+  return { sheet: r.slice(0, i).trim().replace(/^'|'$/g, "").replace(/''/g, "'"),
+           addr: r.slice(i + 1).replace(/\$/g, "").trim() };
+}
+
+function refLabel(ref) {
+  const { sheet, addr } = splitRef(ref);
+  return sheet ? `${sheet}!${addr}` : addr;
+}
+
+async function selectRef(ref) {
+  if (!state.office) { toast("Предпросмотр без Excel: " + refLabel(ref)); return; }
+  let { sheet, addr } = splitRef(ref);
+  // [[Свод]] — ссылка на лист целиком: адреса нет, а «Свод» не похож на A1/A1:B2/A:C
+  if (!sheet && !/^[A-Za-z]{0,3}\d*(:[A-Za-z]{0,3}\d*)?$/.test(addr)) { sheet = addr; addr = ""; }
+  try {
+    await Excel.run(async (ctx) => {
+      const ws = sheet ? ctx.workbook.worksheets.getItem(sheet) : ctx.workbook.worksheets.getActiveWorksheet();
+      ws.activate();
+      if (addr) ws.getRange(addr).select();
+      await ctx.sync();
+    });
+  } catch (e) { toast("Не нашёл в книге: " + refLabel(ref), true); }
+}
+
+function refChip(ref, label) {
+  const b = document.createElement("button");
+  b.className = "cell-ref";
+  b.type = "button";
+  b.textContent = label || refLabel(ref);
+  b.title = "показать в книге";
+  b.onclick = () => selectRef(ref);
+  return b;
+}
+
+/* Текст ответа с кнопками-ссылками. Только текстовые узлы и кнопки — никакого innerHTML. */
+function renderRich(el, text) {
+  const s = text || "";
+  el.textContent = "";
+  REF_RE.lastIndex = 0;
+  let last = 0, m;
+  while ((m = REF_RE.exec(s))) {
+    if (m.index > last) el.appendChild(document.createTextNode(s.slice(last, m.index)));
+    el.appendChild(refChip(m[1]));
+    last = m.index + m[0].length;
+  }
+  if (last < s.length) el.appendChild(document.createTextNode(s.slice(last)));
+}
+
+/* ------------------------------------------------------------------ шаги агента */
+
+const SHEET_ACTIONS = { add: "добавляю лист", rename: "переименовываю лист", delete: "удаляю лист",
+  copy: "копирую лист", move: "перемещаю лист", activate: "переключаюсь на лист", hide: "скрываю лист",
+  unhide: "показываю лист", list: "смотрю листы" };
+
+function toolLabel(name, input) {
+  let a = input;
+  if (typeof a === "string") { try { a = JSON.parse(a); } catch (e) { a = { _raw: a }; } }
+  a = a && typeof a === "object" ? a : {};
+  const where = ((a.sheet ? a.sheet + "!" : "") + (a.range && a.range !== "selection" ? a.range : ""))
+    || (a.range === "selection" ? "выделение" : "");
+  const keys = a.cells && typeof a.cells === "object" ? Object.keys(a.cells) : [];
+  const cells = keys.slice(0, 3).join(", ") + (keys.length > 3 ? "…" : "");
+  switch (name) {
+    case "excel_status": return "Смотрю, что открыто в Excel";
+    case "excel_info": return "Изучаю структуру книги";
+    case "excel_read": return "Читаю " + (where || "лист") + (a.what === "both" || a.what === "formulas" ? " с формулами" : "");
+    case "excel_write": {
+      const tgt = (a.range ? where : (a.sheet && cells ? a.sheet + "!" + cells : cells || where)) || "в лист";
+      return (a.append ? "Дописываю строки в " : "Записываю ") + tgt;
+    }
+    case "excel_find": return `Ищу «${a.query || ""}»`;
+    case "excel_format": return "Оформляю " + (where || "диапазон");
+    case "excel_sheets": return (SHEET_ACTIONS[a.action] || "листы") + (a.name ? ` «${a.name}»` : "");
+    case "excel_calc": return a.expression ? "Вычисляю " + a.expression : "Пересчитываю книгу";
+    case "read_file": return "Читаю файл " + String(a.path || "").split(/[\\/]/).pop();
+    case "write_file": return "Пишу файл " + String(a.path || "").split(/[\\/]/).pop();
+    case "vision_analyze": return "Смотрю изображение";
+    default: return name + (a._raw ? " — " + String(a._raw).slice(0, 80) : "");
+  }
+}
+
+function toolsBox(bubble) {
+  let tl = bubble.querySelector(".tools");
+  if (!tl) {
+    tl = document.createElement("div");
+    tl.className = "tools";
+    bubble.insertBefore(tl, bubble.querySelector(".body"));
+  }
+  return tl;
+}
+
+function addToolRow(bubble, data) {
+  const row = document.createElement("div");
+  row.className = "tool-row pending";
+  row.dataset.id = data.id || "";
+  row.dataset.name = data.name || "";
+  const ic = document.createElement("span"); ic.className = "ic";
+  const tx = document.createElement("span"); tx.className = "tx"; tx.textContent = toolLabel(data.name, data.detail);
+  row.appendChild(ic); row.appendChild(tx);
+  toolsBox(bubble).appendChild(row);
+  scrollDown();
+}
+
+function markToolDone(bubble, data) {
+  const rows = [...bubble.querySelectorAll(".tool-row.pending")];
+  const row = rows.find((r) => data.id && r.dataset.id === data.id)
+    || rows.find((r) => r.dataset.name === data.name) || rows[0];
+  if (!row) return;
+  row.classList.remove("pending");
+  row.classList.add(data.error ? "err" : "ok");
+  if (data.ms) row.title = (data.ms / 1000).toFixed(1) + " с";
+}
+
+/* ------------------------------------------------------------------ правки агента в книге */
+
+const CHANGE_ICON = { write: "✎", clear: "⌫", format: "🎨", sheet: "▤" };
+
+function changeKey(e) { return [e.ts, e.kind, e.sheet, e.range, e.note].join("|"); }
+
+function isUndoable(e) {
+  if (e.other_workbook) return false;
+  return !!e.before || (e.kind === "sheet" && /^добавлен лист/.test(e.note || ""));
+}
+
+function renderChanges(bubble, items) {
+  let card = bubble.querySelector(".changes");
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "changes";
+    bubble.appendChild(card);
+  }
+  card.textContent = "";
+  const head = document.createElement("div");
+  head.className = "ch-head";
+  head.textContent = `Изменения в книге · ${items.length}`;
+  card.appendChild(head);
+  const list = document.createElement("div");
+  list.className = "ch-list";
+  items.forEach((e) => {
+    const row = document.createElement("div");
+    row.className = "ch-row";
+    const ic = document.createElement("span");
+    ic.className = "ic"; ic.textContent = CHANGE_ICON[e.kind] || "•";
+    row.appendChild(ic);
+    if (e.other_workbook) {
+      row.classList.add("other");
+      const wb = document.createElement("span");
+      wb.className = "wb"; wb.textContent = `⚠ ${e.workbook}: ${e.sheet}${e.range ? "!" + e.range : ""}`;
+      wb.title = "правка в другой книге — откройте её и проверьте; отсюда не откатывается";
+      row.appendChild(wb);
+    } else if (e.range) row.appendChild(refChip(`'${e.sheet}'!${e.range}`, `${e.sheet}!${e.range}`));
+    const note = document.createElement("span");
+    note.className = "note";
+    note.textContent = e.kind === "format" ? (e.note ? "оформление: " + e.note : "оформление")
+      : e.kind === "sheet" ? (e.note || "лист") : e.kind === "clear" ? "очищено" : "";
+    row.appendChild(note);
+    list.appendChild(row);
+  });
+  card.appendChild(list);
+  const acts = document.createElement("div");
+  acts.className = "acts";
+  if (card.dataset.undone) {
+    const done = document.createElement("span");
+    done.className = "muted"; done.textContent = "откачено — в книге снова как было до хода";
+    acts.appendChild(done);
+  } else if (items.some(isUndoable)) {
+    const b = document.createElement("button");
+    b.textContent = "Откатить изменения";
+    b.onclick = () => undoChanges(bubble, items);
+    acts.appendChild(b);
+    if (items.some((e) => e.other_workbook)) {
+      const w = document.createElement("span");
+      w.className = "muted warn";
+      w.textContent = "есть правки в другой книге — их отсюда не откатить";
+      acts.appendChild(w);
+    }
+    if (items.some((e) => e.kind === "format" || e.too_big)) {
+      const n = document.createElement("span");
+      n.className = "muted";
+      n.textContent = "оформление и очень большие диапазоны не откатываются";
+      acts.appendChild(n);
+    }
+  }
+  card.appendChild(acts);
+  scrollDown();
+}
+
+/* Откат: в обратном порядке возвращаем то, что лежало в ячейках ДО хода (формулы — формулами). */
+async function undoChanges(bubble, items) {
+  if (!state.office) { toast("Предпросмотр без Excel", true); return; }
+  try {
+    await Excel.run(async (ctx) => {
+      for (const e of [...items].reverse().filter((x) => !x.other_workbook)) {
+        if (e.before && e.range) {
+          ctx.workbook.worksheets.getItem(e.sheet).getRange(e.range).formulas = e.before;
+        } else if (e.kind === "sheet" && /^добавлен лист/.test(e.note || "") && e.sheet) {
+          ctx.workbook.worksheets.getItem(e.sheet).delete();
+        }
+      }
+      await ctx.sync();
+    });
+    const card = bubble.querySelector(".changes");
+    if (card) card.dataset.undone = "1";
+    renderChanges(bubble, items);
+    toast("Изменения агента откачены");
+    readSelection().catch(() => {});
+  } catch (e) {
+    toast("Откат не прошёл: " + (e.message || e), true);
+  }
+}
+
 let toastTimer = null;
 /* Тост с необязательным действием (кнопка): нужен для «Записано … · Отменить» —
    без отката любая запись в лист тревожит пользователя. */
@@ -95,9 +315,10 @@ function storageKey() { return "hermes.session." + (state.workbook || "default")
 function suggestions() {
   const header = (state.ctx.csv.split("\n")[0] || "").split(",").map((s) => s.trim()).filter(Boolean);
   const list = [
-    { t: "Сводка по выделенному", s: "Что в этих данных: итоги, тренд, аномалии" },
-    { t: "Найти ошибки и дубли", s: "проверь пропуски, дубликаты и странные значения" },
-    { t: "Привести к единому виду", s: "стандартизируй заголовки и формат чисел" },
+    { t: "Объясни эту книгу", s: "какие листы, откуда берутся данные и как связаны формулы" },
+    { t: "Найди ошибки в формулах", s: "#ССЫЛКА!, #ЗНАЧ!, битые диапазоны — и почини" },
+    { t: "Сделай сводку на новом листе", s: "итоги формулами по выделенным данным, с оформлением" },
+    { t: "Сводка по выделенному", s: "итоги, тренд, аномалии со ссылками на ячейки" },
   ];
   if (header.length >= 2) {
     list.unshift({ t: `Итоги по «${header[header.length - 1]}»`, s: `сгруппируй по «${header[0]}»` });
@@ -133,7 +354,7 @@ function addMessage(role, text) {
   }
   const body = document.createElement("div");
   body.className = "body";
-  body.textContent = text || "";
+  if (role === "assistant") renderRich(body, text || ""); else body.textContent = text || "";
   wrap.appendChild(body);
   $("chat").appendChild(wrap);
   $("chat").scrollTop = $("chat").scrollHeight;
@@ -170,7 +391,7 @@ function renderDelta(bubble, text) {
   if (state._raf) return;
   state._raf = requestAnimationFrame(() => {
     state._raf = null;
-    bubble.querySelector(".body").textContent = stripBlocks(state._acc);
+    renderRich(bubble.querySelector(".body"), stripBlocks(state._acc));
     scrollDown();
   });
 }
@@ -574,6 +795,8 @@ async function send() {
   let acc = "";
   let logText = "";
   let bubble = null;
+  const changes = [];
+  const seenChanges = new Set();
   try {
     const res = await fetch(BASE + "/chat", {
       method: "POST",
@@ -611,21 +834,31 @@ async function send() {
           if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); startStatus(bubble, t0); }
           bubble.classList.remove("working");
           renderDelta(bubble, acc);
-        } else if (kind === "tool" || kind === "log") {
+        } else if (kind === "tool" || kind === "tool_done" || kind === "log") {
           logText += (data.text || data.name || "") + "\n";
-          // Инструменты пишем всегда, а не только после первого текста: именно они показывают,
+          // Шаги агента пишем всегда, а не только после первого текста: именно они показывают,
           // что агент жив, когда модель «думает» десятки секунд.
           if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); startStatus(bubble, t0); }
-          state.toolCount = (state.toolCount || 0) + (kind === "tool" ? 1 : 0);
-          let tl = bubble.querySelector(".tools");
-          if (!tl) { tl = document.createElement("div"); tl.className = "tools"; bubble.appendChild(tl); }
-          tl.textContent += (tl.textContent ? "\n" : "") + "▸ " + (data.name || "log") +
-            (data.detail ? " — " + String(data.detail).slice(0, 90) : "");
+          if (kind === "tool") { state.toolCount = (state.toolCount || 0) + 1; addToolRow(bubble, data); }
+          else if (kind === "tool_done") markToolDone(bubble, data);
+          else if (data.text && /error|ошибк|traceback/i.test(data.text)) {
+            const row = document.createElement("div");
+            row.className = "tool-row log";
+            row.textContent = String(data.text).slice(0, 160);
+            toolsBox(bubble).appendChild(row);
+          }
+        } else if (kind === "changes") {
+          if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); startStatus(bubble, t0); }
+          (data.items || []).forEach((e) => {
+            const k = changeKey(e);
+            if (!seenChanges.has(k)) { seenChanges.add(k); changes.push(e); }
+          });
+          if (changes.length) renderChanges(bubble, changes);
         } else if (kind === "result") {
           if (data.text) {
             acc = data.text;
             if (!bubble) { hideTyping(); bubble = addMessage("assistant", ""); }
-            bubble.querySelector(".body").textContent = stripBlocks(acc);
+            renderRich(bubble.querySelector(".body"), stripBlocks(acc));
           }
           setSession(data.session_id || state.sessionId);
         } else if (kind === "error") {
@@ -655,6 +888,10 @@ async function send() {
             + (state.toolCount ? ` · ${state.toolCount} инстр.` : "");
           bubble.classList.remove("working");
           bubble.classList.add("done");
+          bubble.querySelectorAll(".tool-row.pending").forEach((r) => { r.classList.remove("pending"); r.classList.add("ok"); });
+          const ch = bubble.querySelector(".changes");
+          if (ch) bubble.appendChild(ch);                     // карточка правок — под текстом ответа
+          if (changes.length) readSelection().catch(() => {}); // контекст после правок агента
           const b = blocks(acc);
           previewBlocks(bubble, b.all);                   // что именно уедет в лист — до записи
           const acts = document.createElement("div");
