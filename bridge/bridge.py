@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -103,7 +103,7 @@ def _refresh_models() -> dict:
 MAX_CONTEXT_ROWS = 400          # сколько строк выделения уходит модели
 MAX_CONTEXT_COLS = 60
 # Идентификатор сессии Hermes: 20260919_144821_ea810f. Валидируем перед подстановкой куда-либо.
-SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,128}")   # local-<64 hex> = 70 символов
 # Панель отвечает текстом и блоками ```csv/```formulas: браузер, картинки, cron и делегирование
 # ей не нужны. Узкий набор вдвое уменьшает промпт (схемы инструментов) и убирает круги
 # «попробовал инструмент — политика запретила». Расширяется через HERMES_BRIDGE_TOOLSETS.
@@ -283,37 +283,74 @@ def session_messages(session_id: str, limit: int = 12) -> list[dict]:
         # В панель не нужно тащить служебные обёртки и служебные роли
         if r["display_kind"] in ("system", "tool_call"):
             continue
+        # реплика из панели = служебная шапка ([Книга Excel], выделение, инструкции) + просьба последним абзацем
+        if r["role"] == "user" and text.startswith("[") and "\n\n" in text:
+            text = text.rsplit("\n\n", 1)[1]
         out.append({"role": r["role"], "text": text[:4000]})
     return out
 
 
-def list_sessions(limit: int = 40) -> list[dict]:
-    """Последние сессии из стора бота (только чтение).
+# Внутренние и служебные источники: в человеческих списках Hermes их нет (kanban/tool/oneshot —
+# INTERNAL_LISTING_SOURCES; subagent/cron — дочерние прогоны делегирования и расписания).
+HIDDEN_SOURCES = ("kanban", "tool", "oneshot", "subagent", "cron")
 
-    Фильтр тот же, что у человеческих списков Hermes: исключаем внутренние источники
-    (kanban/tool/oneshot) и скрытые сессии — иначе панель показывала бы то, чего нет в десктопе,
-    и наоборот.
+
+def list_sessions(limit: int = 40, query: str = "") -> list[dict]:
+    """Чаты Hermes для выбора в панели (только чтение): свежие сверху, с превью первой реплики.
+
+    `query` ищет и по названию, и по тексту реплик (полнотекстовый индекс Hermes с триграммами —
+    то есть по любой подстроке от 3 символов, кириллица тоже). Так в Excel можно подхватить чат
+    из десктопа или CLI, где контекст задачи уже обсуждён: дальше мост продолжает его `--resume`.
     """
     if not STATE_DB.exists():
         return []
+    query = (query or "").strip()[:200]
+    hidden = ",".join("?" * len(HIDDEN_SOURCES))
+    where = [f"COALESCE(s.archived,0)=0", "COALESCE(s.hidden,0)=0",
+             f"COALESCE(s.source,'') NOT IN ({hidden})", "COALESCE(s.message_count,0) > 0"]
+    params: list = list(HIDDEN_SOURCES)
+    if query:
+        like = "%" + query.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        cond = "(s.title LIKE ? ESCAPE '!' OR s.id = ?"
+        params += [like, query]
+        if len(query) >= 3:
+            # фраза в кавычках: пользовательский ввод не должен разбираться как синтаксис FTS5
+            cond += (" OR s.id IN (SELECT m.session_id FROM messages m WHERE m.id IN ("
+                     "SELECT rowid FROM messages_fts_trigram WHERE messages_fts_trigram MATCH ?))")
+            params.append('"' + query.replace('"', '""') + '"')
+        where.append(cond + ")")
+    sql = f"""SELECT s.id, s.title, s.model, s.source, s.message_count, s.started_at,
+                     s.last_activity_at,
+                     (SELECT substr(m.content, 1, 20000) FROM messages m
+                       WHERE m.session_id = s.id AND m.role = 'user'
+                         AND m.content IS NOT NULL AND TRIM(m.content) <> ''
+                       ORDER BY m.id LIMIT 1) AS preview
+                FROM sessions s
+               WHERE {' AND '.join(where)}
+               ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC
+               LIMIT ?"""
+    params.append(int(limit))
     try:
         con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=5)
         con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """SELECT id, title, model, source, message_count, started_at,
-                      last_activity_at, estimated_cost_usd
-                 FROM sessions
-                WHERE COALESCE(archived,0)=0 AND COALESCE(hidden,0)=0
-                  AND COALESCE(source,'') NOT IN ('kanban','tool','oneshot')
-                ORDER BY COALESCE(last_activity_at, started_at) DESC
-                LIMIT ?""",
-            (int(limit),),
-        ).fetchall()
-        con.close()
-        return [dict(r) for r in rows]
+        try:
+            rows = con.execute(sql, params).fetchall()
+        finally:
+            con.close()
     except Exception as exc:                                  # noqa: BLE001
         log("sessions query failed:", exc)
         return []
+    out = []
+    for r in rows:
+        d = dict(r)
+        prev = str(d.get("preview") or "")
+        # реплики из панели начинаются со служебной шапки ([Книга Excel], выделение, инструкции),
+        # а сама просьба пользователя — последний абзац: её и показываем
+        if prev.startswith("[") and "\n\n" in prev:
+            prev = prev.rsplit("\n\n", 1)[1]
+        d["preview"] = " ".join(prev.split())[:160]
+        out.append(d)
+    return out
 
 
 def error_hint(text: str) -> str:
@@ -598,12 +635,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(catalog)
             return
         if path == "/sessions":
-            q = self.path.split("limit=")[-1] if "limit=" in self.path else "40"
+            qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
             try:
-                limit = max(1, min(200, int(q)))
+                limit = max(1, min(200, int((qs.get("limit") or ["40"])[0])))
             except ValueError:
                 limit = 40
-            self._json({"sessions": list_sessions(limit)})
+            self._json({"sessions": list_sessions(limit, (qs.get("q") or [""])[0]), "current_profile": PROFILE})
             return
         if path == "/session":
             sid = ""
@@ -717,6 +754,13 @@ class Handler(BaseHTTPRequestHandler):
         query = build_query(prompt, context, str(body.get("file_name") or ""),
                             str(body.get("sheet") or ""), str(body.get("range") or ""), shape,
                             clean_attachments(body.get("attachments")))
+        if session_id and session_id != "new":
+            # продолжаем чат, начатый, возможно, не в панели (десктоп, CLI): навык панели к нему
+            # флагом -s не подключить (см. ниже), поэтому просим агента загрузить его самому
+            query = ("[Панель Excel] Этот чат теперь продолжается из надстройки Excel. Если навык "
+                     "excel-pane-contract в этом чате ещё не загружен — загрузи его (skill_view) и следуй "
+                     "ему: правь открытую книгу инструментами excel_*, не сохраняй её без просьбы, "
+                     "ссылайся на ячейки как [[Лист!A1]].\n\n" + query)
 
         run_id = uuid.uuid4().hex[:8]
         qfile = QUERY_DIR / f"query-{run_id}.txt"
@@ -728,29 +772,35 @@ class Handler(BaseHTTPRequestHandler):
         cmd = [HERMES]
         if PROFILE and PROFILE != "default":
             cmd += ["-p", PROFILE]
-        cmd += ["chat", "-Q", "--format", "stream-json", "--query-file", str(qfile),
-                "--max-turns", max_turns, "--in", str(PANE_DIR)]
-        if PANE_SOURCE:
-            # без метки сессия уедет в source='oneshot' и пропадёт из списков Hermes
-            cmd += ["--source", PANE_SOURCE]
-        if PANE_TOOLSETS:
-            cmd += ["-t", PANE_TOOLSETS]
-        for skill in PANE_SKILLS:
-            cmd += ["-s", skill]
-        if RUN_BUDGET > 0:
-            cmd += ["--run-budget", str(int(RUN_BUDGET))]
-
-        if session_id and session_id != "new":
+        resuming = bool(session_id and session_id != "new")
+        cmd += ["chat", "-Q", "--format", "stream-json", "--query-file", str(qfile)]
+        if resuming:
+            # На --resume Hermes держит политику, с которой сессию запустили: ЛЮБОЙ флаг создания
+            # (--source, -t, -s, -m, --provider, --reasoning, --max-turns, --in), отличающийся от
+            # исходного, валит прогон с exit 2 («creation overrides are unsupported on resume»).
+            # Поэтому продолжение чата — без них: модель и усилие остаются те, что у чата.
+            # Инструменты excel_* у чатов из десктопа/CLI и так есть (плагин включён в профиле,
+            # набор по умолчанию подгружает их через tool_describe), правила панели — в самом запросе.
             cmd += ["--resume", session_id]
-        if model and model != "auto":
-            cmd += ["-m", model]
-        # Провайдеры вида "custom:http://..." — это динамически добавленные OpenAI-совместимые
-        # эндпоинты, их нельзя передать в --provider по имени: пусть Hermes маршрутизирует сам.
-        if provider and provider != "auto" and not provider.startswith("custom"):
-            cmd += ["--provider", provider]
-
-        if reasoning and reasoning != "auto":
-            cmd += ["--reasoning", reasoning]
+        else:
+            cmd += ["--max-turns", max_turns, "--in", str(PANE_DIR)]
+            if PANE_SOURCE:
+                # без метки сессия уедет в source='oneshot' и пропадёт из списков Hermes
+                cmd += ["--source", PANE_SOURCE]
+            if PANE_TOOLSETS:
+                cmd += ["-t", PANE_TOOLSETS]
+            for skill in PANE_SKILLS:
+                cmd += ["-s", skill]
+            if RUN_BUDGET > 0:
+                cmd += ["--run-budget", str(int(RUN_BUDGET))]
+            if model and model != "auto":
+                cmd += ["-m", model]
+            # Провайдеры вида "custom:http://..." — это динамически добавленные OpenAI-совместимые
+            # эндпоинты, их нельзя передать в --provider по имени: пусть Hermes маршрутизирует сам.
+            if provider and provider != "auto" and not provider.startswith("custom"):
+                cmd += ["--provider", provider]
+            if reasoning and reasoning != "auto":
+                cmd += ["--reasoning", reasoning]
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")

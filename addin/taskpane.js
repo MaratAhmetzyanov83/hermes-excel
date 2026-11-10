@@ -592,7 +592,9 @@ function renderBridge() {
   const el = $("sessionInfo");
   if (state.bridgeOk === true) {
     el.className = "muted";
-    el.textContent = (state.botLabel ? state.botLabel + " · " : "") + (state.sessionId || "новый чат");
+    const name = state.sessionId ? (state.sessionTitle || state.sessionId) : "новый чат";
+    el.textContent = (state.botLabel ? state.botLabel + " · " : "") + (name.length > 42 ? name.slice(0, 41) + "…" : name);
+    el.title = state.sessionId || "";
   } else if (state.bridgeOk === false) {
     el.className = "muted";
     el.innerHTML = 'мост не запущен — <a href="#" id="btnRetry" class="link">подключиться</a>';
@@ -637,18 +639,85 @@ function refreshModels(provs, preselect) {
   [...selM.options].forEach((o) => { if (o.value === saved) selM.value = saved; });
 }
 
-async function loadSessions() {
+/* Выбор чата Hermes: можно подхватить разговор из десктопа/CLI, где контекст задачи уже есть.
+   Мост ищет по названию и тексту реплик; выбранный чат продолжается `--resume` уже с этой книгой. */
+const SOURCE_LABEL = { gui: "Desktop", desktop: "Desktop", local: "CLI / Excel", cli: "CLI", tui: "TUI",
+  telegram: "Telegram", discord: "Discord", slack: "Slack", whatsapp: "WhatsApp", acp: "IDE" };
+
+function chatWhen(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000), now = new Date();
+  if (d.toDateString() === now.toDateString())
+    return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const opts = { day: "2-digit", month: "2-digit" };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = "2-digit";
+  return d.toLocaleDateString("ru-RU", opts);
+}
+
+async function loadSessions(query) {
+  const q = query == null ? ($("chatSearch") ? $("chatSearch").value.trim() : "") : query;
+  const seq = (state.chatSeq = (state.chatSeq || 0) + 1);
   try {
-    const r = await fetch(BASE + "/sessions?limit=40", { cache: "no-store" });
+    const r = await fetch(BASE + "/sessions?limit=60&q=" + encodeURIComponent(q), { cache: "no-store" });
     const data = await r.json();
-    const sel = $("sessionPick");
-    sel.innerHTML = '<option value="">продолжить другой чат…</option>';
-    (data.sessions || []).forEach((s) => {
-      const when = new Date((s.last_activity_at || s.started_at) * 1000)
-        .toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
-      sel.add(new Option(`${when} · ${(s.title || s.id).slice(0, 46)}`, s.id));
-    });
-  } catch (e) { /* мост молчит */ }
+    if (seq !== state.chatSeq) return;            // пришёл ответ на устаревший запрос поиска
+    state.chats = data.sessions || [];
+    const cur = state.chats.find((s) => s.id === state.sessionId);
+    if (cur && !state.sessionTitle) { state.sessionTitle = cur.title || cur.preview || ""; renderBridge(); }
+    renderChats(q);
+  } catch (e) {
+    if (seq === state.chatSeq && $("chatList")) $("chatList").innerHTML = '<div class="chat-empty">мост недоступен</div>';
+  }
+}
+
+function renderChats(q) {
+  const box = $("chatList");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!state.chats || !state.chats.length) {
+    const e = document.createElement("div");
+    e.className = "chat-empty";
+    e.textContent = q ? "Ничего не нашлось" : "Чатов пока нет";
+    box.append(e);
+    return;
+  }
+  state.chats.forEach((s) => {
+    const b = document.createElement("button");
+    b.className = "chat-item" + (s.id === state.sessionId ? " current" : "");
+    b.title = s.id;
+    const t = document.createElement("div"); t.className = "t"; t.textContent = s.title || s.preview || s.id;
+    const p = document.createElement("div"); p.className = "p"; p.textContent = s.title ? (s.preview || "") : "";
+    const m = document.createElement("div"); m.className = "m";
+    const src = document.createElement("span"); src.className = "src"; src.textContent = SOURCE_LABEL[s.source] || s.source || "?";
+    const info = document.createElement("span");
+    info.textContent = [chatWhen(s.last_activity_at || s.started_at), s.message_count ? s.message_count + " сообщ." : ""]
+      .filter(Boolean).join(" · ");
+    m.append(src, info);
+    b.append(t);
+    if (p.textContent) b.append(p);
+    b.append(m);
+    b.onclick = () => pickChat(s);
+    box.append(b);
+  });
+}
+
+function pickChat(s) {
+  setSession(s.id, s.title || s.preview || "");
+  state.messages = [];
+  emptyState();
+  loadHistory();
+  $("chatsPanel").classList.add("hidden");
+  toast("Продолжаю чат: " + (s.title || s.preview || s.id).slice(0, 60));
+}
+
+function toggleChats() {
+  const panel = $("chatsPanel");
+  const open = panel.classList.toggle("hidden") === false;
+  if (open) {
+    $("settings").classList.add("hidden");
+    loadSessions();
+    setTimeout(() => $("chatSearch").focus(), 0);
+  }
 }
 
 /* Лента чата после перезапуска Excel: сессия на книгу сохранена, но панель начинала с пустого
@@ -670,7 +739,8 @@ async function loadHistory() {
   } catch (e) { /* мост молчит — не мешаем работать */ }
 }
 
-function setSession(id) {
+function setSession(id, title) {
+  if ((id || "") !== state.sessionId || title !== undefined) state.sessionTitle = title || "";
   state.sessionId = id || "";
   if (id) localStorage.setItem(storageKey(), id); else localStorage.removeItem(storageKey());
   renderBridge();
@@ -954,7 +1024,7 @@ async function stop() {
 }
 
 async function openInHermes() {
-  const sid = state.sessionId || $("sessionPick").value;
+  const sid = state.sessionId;
   if (!sid) { toast("Сначала напишите Hermes", true); return; }
   try {
     const r = await fetch(BASE + "/open", {
@@ -984,7 +1054,7 @@ function wire() {
     emptyState();
     toast("Новый чат");
   };
-  $("btnSettings").onclick = () => $("settings").classList.toggle("hidden");
+  $("btnSettings").onclick = () => { $("chatsPanel").classList.add("hidden"); $("settings").classList.toggle("hidden"); };
   $("btnRefresh").onclick = () => { state.ctxDirty = false; readSelection().then(() => toast("Выделение обновлено")).catch((e) => toast(e.message, true)); };
   $("btnEditCtx").onclick = () => $("ctxEdit").classList.toggle("hidden");
   $("btnCtxDone").onclick = () => { $("ctxEdit").classList.add("hidden"); toast("Данные для контекста обновлены"); };
@@ -1036,10 +1106,15 @@ function wire() {
     localStorage.setItem("hermes.provider", $("providerSel").value);
     fetch(BASE + "/models").then((r) => r.json()).then((d) => refreshModels(d.providers, "")).catch(() => {});
   };
-  $("sessionPick").onchange = () => {
-    const v = $("sessionPick").value;
-    if (v) { setSession(v); loadHistory(); toast("Продолжаю чат " + v); }
-  };
+  $("btnChats").onclick = toggleChats;
+  $("chatSearch").addEventListener("input", () => {
+    clearTimeout(state._chatT);
+    state._chatT = setTimeout(() => loadSessions(), 250);
+  });
+  $("chatSearch").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") $("chatsPanel").classList.add("hidden");
+    if (e.key === "Enter" && state.chats && state.chats[0]) pickChat(state.chats[0]);
+  });
   $("prompt").addEventListener("input", autoGrow);
   // вложения: скрепка, перетаскивание в панель, вставка из буфера
   $("btnAttach").onclick = () => $("filePick").click();
